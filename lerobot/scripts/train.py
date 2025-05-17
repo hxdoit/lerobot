@@ -67,8 +67,17 @@ def update_policy(
     start_time = time.perf_counter()
     device = get_device_from_parameters(policy)
     policy.train()
+    batch = {
+        'observation.images.laptop': batch['observation.images.laptop'][:, 0],
+        'observation.images.phone': batch['observation.images.phone'][:, 0],
+        'observation.state': batch['observation.state'][:, 0],
+        'action': batch['action'],
+        'reward': batch['reward'],
+        'action_is_pad': batch['action_is_pad'],
+        'reward_is_pad': batch['reward_is_pad'],
+    }
     with torch.autocast(device_type=device.type) if use_amp else nullcontext():
-        loss, output_dict = policy.forward(batch)
+        loss, output_dict, out_actions = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
     grad_scaler.scale(loss).backward()
 

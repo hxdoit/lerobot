@@ -101,6 +101,17 @@ def save_checkpoint(
     cfg.save_pretrained(pretrained_dir)
     save_training_state(checkpoint_dir, step, optimizer, scheduler)
 
+def save_td3_checkpoint(
+    checkpoint_dir: Path,
+    step: int,
+    cfg: TrainPipelineConfig,
+    policy
+) -> None:
+    pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+    policy.save_pretrained(pretrained_dir)
+    cfg.save_pretrained(pretrained_dir)
+    #save_training_state(checkpoint_dir, step, optimizer, scheduler)
+
 
 def save_training_state(
     checkpoint_dir: Path,

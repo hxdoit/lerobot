@@ -450,7 +450,8 @@ class OpenCVCamera:
             time.sleep(1 / self.fps)
             num_tries += 1
             if num_tries > self.fps * 2:
-                raise TimeoutError("Timed out waiting for async_read() to start.")
+                pass
+                #raise TimeoutError("Timed out waiting for async_read() to start.")
 
     def disconnect(self):
         if not self.is_connected:

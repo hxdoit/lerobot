@@ -47,6 +47,10 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.common.policies.act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "critic":
+        from lerobot.common.policies.act.model_td3 import CriticPolicy
+
+        return CriticPolicy
     elif name == "vqbet":
         from lerobot.common.policies.vqbet.modeling_vqbet import VQBeTPolicy
 
@@ -84,6 +88,7 @@ def make_policy(
     cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata | None = None,
     env_cfg: EnvConfig | None = None,
+    type: str = ''
 ) -> PreTrainedPolicy:
     """Make an instance of a policy class.
 
@@ -121,7 +126,10 @@ def make_policy(
             "Please use `cpu` or `cuda` backend."
         )
 
-    policy_cls = get_policy_class(cfg.type)
+    if type != '':
+        policy_cls = get_policy_class(type)
+    else:
+        policy_cls = get_policy_class(cfg.type)
 
     kwargs = {}
     if ds_meta is not None:

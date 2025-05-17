@@ -28,6 +28,7 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+from torchvision import transforms
 
 
 def get_safe_default_codec():
@@ -237,6 +238,11 @@ def decode_video_frames_torchcodec(
         logging.info(f"{closest_ts=}")
 
     # convert to float32 in [0,1] range (channel first)
+    resize_fun = transforms.Resize((480, 640))
+    closest_frames_arr = []
+    for frame in closest_frames:
+        closest_frames_arr.append(resize_fun(frame))
+    closest_frames = torch.stack(closest_frames_arr)
     closest_frames = closest_frames.type(torch.float32) / 255
 
     assert len(timestamps) == len(closest_frames)

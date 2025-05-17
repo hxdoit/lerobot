@@ -27,7 +27,9 @@ from functools import cache
 import cv2
 import torch
 from deepdiff import DeepDiff
+from sympy.codegen.ast import float32
 from termcolor import colored
+from torchvision import transforms
 
 from lerobot.common.datasets.image_writer import safe_stop_image_writer
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -37,6 +39,11 @@ from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.utils import get_safe_torch_device, has_method
 
+from math import pi
+import apriltag
+import numpy as np
+from scipy.spatial import ConvexHull
+from shapely.geometry import Polygon
 
 def log_control_info(robot: Robot, dt_s, episode_index=None, frame_index=None, fps=None):
     log_items = []
@@ -108,10 +115,12 @@ def predict_action(observation, policy, device, use_amp):
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
+        resize_fun = transforms.Resize((480, 640))
         for name in observation:
             if "image" in name:
-                observation[name] = observation[name].type(torch.float32) / 255
                 observation[name] = observation[name].permute(2, 0, 1).contiguous()
+                observation[name] = resize_fun(observation[name])
+                observation[name] = observation[name].type(torch.float32) / 255
             observation[name] = observation[name].unsqueeze(0)
             observation[name] = observation[name].to(device)
 
@@ -209,6 +218,63 @@ def record_episode(
         single_task=single_task,
     )
 
+def rotationMatrixToEulerAngles(R):
+    sy = np.sqrt(R[0,0] * R[0,0] + R[1,0] * R[1,0])
+    singular = sy < 1e-6
+    if not singular :
+        x = np.arctan2(R[2,1] , R[2,2])
+        y = np.arctan2(-R[2,0], sy)
+        z = np.arctan2(R[1,0], R[0,0])
+    else :
+        x = np.arctan2(-R[1,2], R[1,1])
+        y = np.arctan2(-R[2,0], sy)
+        z = 0
+    return np.array([x, y, z])
+
+def compute_transform(T_A_to_cam, T_B_to_cam):
+    # 计算cam→B的逆变换
+    T_cam_to_B = np.linalg.inv(T_B_to_cam[0])
+    # 组合变换矩阵
+    T_A_to_B = T_cam_to_B @ T_A_to_cam[0]
+    return T_A_to_B
+
+def draw_image_points(frame, img_pts):
+    img_pts = img_pts.reshape(-1, 2).astype(int)
+    # 绘制前后面
+    for i in range(4):
+        cv2.line(frame, tuple(img_pts[i]), tuple(img_pts[(i + 1) % 4]), (0, 255, 0), 1)
+        cv2.line(frame, tuple(img_pts[i + 4]), tuple(img_pts[(i + 1) % 4 + 4]), (0, 0, 255), 1)
+        cv2.line(frame, tuple(img_pts[i]), tuple(img_pts[i + 4]), (255, 0, 0), 1)
+
+def compute_iou(poly1_coords, poly2_coords):
+    # 创建多边形对象
+    poly1 = Polygon(poly1_coords)
+    poly2 = Polygon(poly2_coords)
+    # 计算交集面积
+    intersection = poly1.intersection(poly2)
+    area_intersection = intersection.area
+    # 计算各自面积
+    area_poly1 = poly1.area
+    area_poly2 = poly2.area
+    # 计算并集面积
+    area_union = area_poly1 + area_poly2 - area_intersection
+    # 防止除以零
+    if area_union == 0:
+        return 0.0
+    iou = area_intersection / area_union
+    return iou
+
+def get_convex_hull(points):
+    """计算凸包顶点并按顺时针排序"""
+    yz_points = points[:, 1:3] # y,z平面
+    hull = ConvexHull(yz_points)
+    ordered_points = yz_points[hull.vertices]
+    return ordered_points
+
+def draw_text(frame, text, height_coord, show_text):
+    if show_text:
+        cv2.putText(frame, text, (50, height_coord), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1,
+                cv2.LINE_AA)
 
 @safe_stop_image_writer
 def control_loop(
@@ -241,6 +307,76 @@ def control_loop(
     if dataset is not None and fps is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset['fps']} != {fps}).")
 
+    camera_name = 'desktop'
+    tag_obj_id = 0
+    tag_size = 0.017  # m
+
+    # 　目标物体的size
+    obj_width = 0.03
+    obj_height = 0.03
+    obj_length = 0.056
+    virtual_obj_on_grasp_z_shift = 0.009
+
+    show_obj_tag_cube = False
+    show_grasp_tag_cube = False
+    show_virtual_obj_on_grasp = False
+    show_virtual_obj_on_obj = False
+    show_text = False
+
+    tag_3d_corners = np.array([
+        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
+        [tag_size / 2, -tag_size / 2, 0],  # 右下前
+        [tag_size / 2, tag_size / 2, 0],  # 右上前
+        [-tag_size / 2, tag_size / 2, 0],  # 左上前
+        [-tag_size / 2, -tag_size / 2, tag_size],  # 左下后
+        [tag_size / 2, -tag_size / 2, tag_size],  # 右下后
+        [tag_size / 2, tag_size / 2, tag_size],  # 右上后
+        [-tag_size / 2, tag_size / 2, tag_size]  # 左上后
+    ])
+    tag_axis = np.array([
+        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
+        [tag_size, -tag_size / 2, 0],  # 右下前
+        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
+        [-tag_size / 2, tag_size, 0],  # 左上前
+        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
+        [-tag_size / 2, -tag_size / 2, tag_size * 2],  # 左下后
+    ])
+    virtual_obj_3d_corners = np.array([
+        [-obj_width / 2, -obj_length / 2, -obj_height / 2],  # 左下前
+        [obj_width / 2, -obj_length / 2, -obj_height / 2],  # 右下前
+        [obj_width / 2, obj_length / 2, -obj_height / 2],  # 右上前
+        [-obj_width / 2, obj_length / 2, -obj_height / 2],  # 左上前
+        [-obj_width / 2, -obj_length / 2, obj_height / 2],  # 左下后
+        [obj_width / 2, -obj_length / 2, obj_height / 2],  # 右下后
+        [obj_width / 2, obj_length / 2, obj_height / 2],  # 右上后
+        [-obj_width / 2, obj_length / 2, obj_height / 2]  # 左上后
+    ])
+    # 抓手上的虚拟box要往里收一下，保证抓手在合适抓取位置时，这２个box投影到桌面上时能够对齐
+    virtual_obj_on_grasp_3d_corners = virtual_obj_3d_corners.copy()
+    virtual_obj_on_grasp_3d_corners[:, 2] += virtual_obj_on_grasp_z_shift
+
+    if camera_name == 'desktop':
+        print('desktop')
+        K = np.array([[1592.776294, 0.000000, 655.148278],
+                      [0.000000, 1595.337130, 402.386737],
+                      [0.000000, 0.000000, 1.000000]])
+        distCoeffs = np.array([0.089836, 0.058097, 0.029668, 0.028918, 0.000000])
+    else:
+        print('other')
+        K = np.array([[671.907962, 0.000000, 639.211904],
+                      [0.000000, 674.667340, 360.929253],
+                      [0.000000, 0.000000, 1.000000]])
+        distCoeffs = np.array([0.109473, -0.127263, 0.000050, 0.003589, 0.000000])
+    cameraparam = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
+    # 不用效果更好
+    distCoeffs = None
+
+    # 设置AprilTag检测器的参数
+    options = apriltag.DetectorOptions(families='tag36h11', border=0)
+    # 初始化AprilTag检测器
+    at_detector = apriltag.Detector(options)
+
+
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
@@ -260,8 +396,72 @@ def control_loop(
                 action = robot.send_action(pred_action)
                 action = {"action": action}
 
+        laptop_frame = observation['observation.images.laptop'].numpy()
+        gray = cv2.cvtColor(laptop_frame, cv2.COLOR_BGR2GRAY)
+        # 检测AprilTag
+        tags = at_detector.detect(gray)
+        tag_obj_result = None
+        for tag in tags:
+            if tag.tag_id == tag_obj_id:
+                tag_obj_result = at_detector.detection_pose(tag, cameraparam, tag_size=tag_size)
+                if show_obj_tag_cube:
+                    img_pts, _ = cv2.projectPoints(
+                        tag_3d_corners, tag_obj_result[0][:3, :3], tag_obj_result[0][:3, 3], K, distCoeffs=distCoeffs
+                    )
+                    draw_image_points(laptop_frame, img_pts)
+                if show_virtual_obj_on_obj:
+                    img_pts, _ = cv2.projectPoints(
+                        virtual_obj_3d_corners, tag_obj_result[0][:3, :3], tag_obj_result[0][:3, 3], K,
+                        distCoeffs=distCoeffs
+                    )
+                    draw_image_points(laptop_frame, img_pts)
+        total_reward = 0.0
+        for tag in tags:
+            if tag.tag_id == tag_obj_id:
+                continue
+            result = at_detector.detection_pose(tag, cameraparam, tag_size=tag_size)
+            if show_grasp_tag_cube:
+                img_pts, _ = cv2.projectPoints(tag_3d_corners, result[0][:3, :3], result[0][:3, 3], K,
+                                               distCoeffs=distCoeffs)
+                draw_image_points(laptop_frame, img_pts)
+
+            if tag_obj_result is not None:
+                tag_grasp_2_obj = compute_transform(result, tag_obj_result)
+                rot_between_2tags = tag_grasp_2_obj[:3, :3]
+                trans_between_2tags = tag_grasp_2_obj[:3, 3]
+                distance_between_2tags = np.sqrt(np.sum(trans_between_2tags ** 2))
+                image_text = "Tag ID: %d, distance to tag_obj: %.2f" % (tag.tag_id, distance_between_2tags)
+                draw_text(laptop_frame, image_text, 50, show_text)
+                image_text = "coord in tag_obj: %s" % ["%.2f" % item for item in trans_between_2tags]
+                draw_text(laptop_frame, image_text, 100, show_text)
+                eulerangles = rotationMatrixToEulerAngles(rot_between_2tags) * 180.0 / pi
+                image_text = "euler in tag_obj: %s" % ["%.2f" % item for item in eulerangles]
+                draw_text(laptop_frame, image_text, 150, show_text)
+
+                temp = (rot_between_2tags @ virtual_obj_on_grasp_3d_corners.T).T + trans_between_2tags
+                if show_virtual_obj_on_grasp:
+                    # 抓手上的二维码坐标系转换到目标物体上的二维码的坐标系
+                    img_pts, _ = cv2.projectPoints(temp, tag_obj_result[0][:3, :3],
+                                                   tag_obj_result[0][:3, 3], K, distCoeffs=distCoeffs)
+                    draw_image_points(laptop_frame, img_pts)
+                iou = compute_iou(get_convex_hull(temp), get_convex_hull(virtual_obj_3d_corners))
+                image_text = "iou: %.2f" % iou
+                draw_text(laptop_frame, image_text, 200, show_text)
+
+                distance_between_2tags *= 100
+                distance_between_2tags = (9 - distance_between_2tags) + 9 if distance_between_2tags < 9 else distance_between_2tags
+                distance_reward = 0.6 * np.exp(-0.12 * (distance_between_2tags - 9))
+                euler_sum = np.sum(np.abs(eulerangles))
+                euler_reward = 0.2 * (1 - euler_sum / 45) if distance_between_2tags < 13 and euler_sum < 45 else 0
+                iou_reward = 0.2 * iou
+                total_reward = distance_reward + euler_reward + iou_reward
+                image_text = ("reward: %.2f, dis_reward: %.2f, eul_reward: %.2f, iou_reward: %.2f"
+                              % (total_reward, distance_reward, euler_reward, iou_reward))
+                draw_text(laptop_frame, image_text, 250, show_text)
+
         if dataset is not None:
-            frame = {**observation, **action, "task": single_task}
+            frame = {**observation, **action, "task": single_task,
+                     'reward': np.array([total_reward], dtype=np.float32)}
             dataset.add_frame(frame)
 
         if display_cameras and not is_headless():

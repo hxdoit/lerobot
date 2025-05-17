@@ -76,7 +76,7 @@ def train(cfg: TrainPipelineConfig):
             actions.append(item['action'][0].numpy())
             qpos.append(item['observation.state'].numpy())
             start += 1
-        hdf5path = os.path.join('/home/ubuntu/Downloads/lerobot/hdf5/', f'episode_{idx}.hdf5')
+        hdf5path = os.path.join('/home/ubuntu/Downloads/lerobot/hdf5_right_left/', f'episode_{idx}.hdf5')
         print(hdf5path)
         with h5py.File(hdf5path, 'w') as f:
             f.create_dataset('action', data=np.array(actions))

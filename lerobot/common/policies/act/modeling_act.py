@@ -22,7 +22,7 @@ The majority of changes here involve removing unused code, unifying naming, and 
 import math
 from collections import deque
 from itertools import chain
-from typing import Callable
+from typing import Callable, Any
 
 import einops
 import numpy as np
@@ -142,7 +142,7 @@ class ACTPolicy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor | Any, dict[str, int | float | bool | Any], Any]:
         """Run the batch through the model and compute the loss for training or validation."""
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
@@ -151,7 +151,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         batch = self.normalize_targets(batch)
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
-
+        unnormal_actions_hat = self.unnormalize_outputs({"action": actions_hat})["action"]
         l1_loss = (
             F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
@@ -170,7 +170,29 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
-        return loss, loss_dict
+        return loss, loss_dict, unnormal_actions_hat
+    def feature_extract_params(self):
+        i = 0
+        target_member = [
+            'model.vae_encoder.',
+            'model.vae_encoder_cls_embed.',
+            'model.vae_encoder_robot_state_input_proj.',
+            'model.vae_encoder_action_input_proj.',
+            'model.vae_encoder_latent_output_proj.',
+            'model.vae_encoder_pos_enc.',
+            'model.backbone.',
+            'model.encoder.',
+            'model.encoder_robot_state_input_proj.',
+            # 'model.encoder_env_state_input_proj',
+            'model.encoder_latent_input_proj.',
+            'model.encoder_img_feat_input_proj.',
+            'model.encoder_1d_feature_pos_embed.',
+            'model.encoder_cam_feat_pos_embed.',
+        ]
+        for ele in self.named_parameters():
+            for key in target_member:
+                if key in ele[0]:
+                    yield ele[1]
 
 
 class ACTTemporalEnsembler:

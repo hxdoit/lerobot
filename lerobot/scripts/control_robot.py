@@ -139,6 +139,8 @@ import time
 from dataclasses import asdict
 from pprint import pformat
 
+import numpy as np
+
 # from safetensors.torch import load_file, save_file
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.policies.factory import make_policy
@@ -235,7 +237,7 @@ def teleoperate(robot: Robot, cfg: TeleoperateControlConfig):
         display_cameras=cfg.display_cameras,
     )
 
-
+#python lerobot/scripts/control_robot.py   --robot.type=so100   --control.type=record   --control.fps=30   --control.single_task="Put the yellow toy block in a stainless steel bowl."   --control.repo_id=hxdoso/so100_test   --control.tags='["so100","tutorial"]'   --control.warmup_time_s=5   --control.episode_time_s=300   --control.reset_time_s=30   --control.num_episodes=1 --control.resume=true
 @safe_disconnect
 def record(
     robot: Robot,
@@ -324,6 +326,13 @@ def record(
 
         if events["stop_recording"]:
             break
+
+    observation = robot.capture_observation()
+    joint_targets = np.linspace(observation['observation.state'],
+                                [-0.9667969, 195.55664, 176.3086, 64.95117, -10.458984, 0.5028736], 100)
+    for target in joint_targets:
+        robot.send_action(target)
+        time.sleep(0.03)
 
     log_say("Stop recording", cfg.play_sounds, blocking=True)
     stop_recording(robot, listener, cfg.display_cameras)
