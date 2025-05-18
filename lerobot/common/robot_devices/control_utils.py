@@ -23,12 +23,14 @@ import traceback
 from contextlib import nullcontext
 from copy import copy
 from functools import cache
+from typing import List, Type
 
 import cv2
 import torch
 from deepdiff import DeepDiff
 from sympy.codegen.ast import float32
 from termcolor import colored
+from torch import nn, device
 from torchvision import transforms
 
 from lerobot.common.datasets.image_writer import safe_stop_image_writer
@@ -107,7 +109,6 @@ def is_headless():
         print()
         return True
 
-
 def predict_action(observation, policy, device, use_amp):
     observation = copy(observation)
     with (
@@ -126,7 +127,7 @@ def predict_action(observation, policy, device, use_amp):
 
         # Compute the next action with the policy
         # based on the current observation
-        action = policy.select_action(observation)
+        action = policy(observation)
 
         # Remove batch dimension
         action = action.squeeze(0)
@@ -308,20 +309,12 @@ def control_loop(
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset['fps']} != {fps}).")
 
     camera_name = 'desktop'
-    tag_obj_id = 0
+    tag_obj_id = 11
     tag_size = 0.017  # m
 
-    # 　目标物体的size
-    obj_width = 0.03
-    obj_height = 0.03
-    obj_length = 0.056
-    virtual_obj_on_grasp_z_shift = 0.009
-
-    show_obj_tag_cube = False
-    show_grasp_tag_cube = False
-    show_virtual_obj_on_grasp = False
-    show_virtual_obj_on_obj = False
-    show_text = False
+    show_obj_tag_cube = True
+    show_grasp_tag_cube = True
+    show_text = True
 
     tag_3d_corners = np.array([
         [-tag_size / 2, -tag_size / 2, 0],  # 左下前
@@ -333,27 +326,6 @@ def control_loop(
         [tag_size / 2, tag_size / 2, tag_size],  # 右上后
         [-tag_size / 2, tag_size / 2, tag_size]  # 左上后
     ])
-    tag_axis = np.array([
-        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
-        [tag_size, -tag_size / 2, 0],  # 右下前
-        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
-        [-tag_size / 2, tag_size, 0],  # 左上前
-        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
-        [-tag_size / 2, -tag_size / 2, tag_size * 2],  # 左下后
-    ])
-    virtual_obj_3d_corners = np.array([
-        [-obj_width / 2, -obj_length / 2, -obj_height / 2],  # 左下前
-        [obj_width / 2, -obj_length / 2, -obj_height / 2],  # 右下前
-        [obj_width / 2, obj_length / 2, -obj_height / 2],  # 右上前
-        [-obj_width / 2, obj_length / 2, -obj_height / 2],  # 左上前
-        [-obj_width / 2, -obj_length / 2, obj_height / 2],  # 左下后
-        [obj_width / 2, -obj_length / 2, obj_height / 2],  # 右下后
-        [obj_width / 2, obj_length / 2, obj_height / 2],  # 右上后
-        [-obj_width / 2, obj_length / 2, obj_height / 2]  # 左上后
-    ])
-    # 抓手上的虚拟box要往里收一下，保证抓手在合适抓取位置时，这２个box投影到桌面上时能够对齐
-    virtual_obj_on_grasp_3d_corners = virtual_obj_3d_corners.copy()
-    virtual_obj_on_grasp_3d_corners[:, 2] += virtual_obj_on_grasp_z_shift
 
     if camera_name == 'desktop':
         print('desktop')
@@ -387,15 +359,6 @@ def control_loop(
         else:
             observation = robot.capture_observation()
 
-            if policy is not None:
-                pred_action = predict_action(
-                    observation, policy, get_safe_torch_device(policy.config.device), policy.config.use_amp
-                )
-                # Action can eventually be clipped using `max_relative_target`,
-                # so action actually sent is saved in the dataset.
-                action = robot.send_action(pred_action)
-                action = {"action": action}
-
         laptop_frame = observation['observation.images.laptop'].numpy()
         gray = cv2.cvtColor(laptop_frame, cv2.COLOR_BGR2GRAY)
         # 检测AprilTag
@@ -409,15 +372,11 @@ def control_loop(
                         tag_3d_corners, tag_obj_result[0][:3, :3], tag_obj_result[0][:3, 3], K, distCoeffs=distCoeffs
                     )
                     draw_image_points(laptop_frame, img_pts)
-                if show_virtual_obj_on_obj:
-                    img_pts, _ = cv2.projectPoints(
-                        virtual_obj_3d_corners, tag_obj_result[0][:3, :3], tag_obj_result[0][:3, 3], K,
-                        distCoeffs=distCoeffs
-                    )
-                    draw_image_points(laptop_frame, img_pts)
-        total_reward = 0.0
+
+        trans_between_2tags = np.array([0.0, 0.0, 0.0])
+        eulerangles = np.array([0.0, 0.0, 0.0])
         for tag in tags:
-            if tag.tag_id == tag_obj_id:
+            if tag.tag_id == tag_obj_id or tag.tag_id == 10:
                 continue
             result = at_detector.detection_pose(tag, cameraparam, tag_size=tag_size)
             if show_grasp_tag_cube:
@@ -437,31 +396,27 @@ def control_loop(
                 eulerangles = rotationMatrixToEulerAngles(rot_between_2tags) * 180.0 / pi
                 image_text = "euler in tag_obj: %s" % ["%.2f" % item for item in eulerangles]
                 draw_text(laptop_frame, image_text, 150, show_text)
-
-                temp = (rot_between_2tags @ virtual_obj_on_grasp_3d_corners.T).T + trans_between_2tags
-                if show_virtual_obj_on_grasp:
-                    # 抓手上的二维码坐标系转换到目标物体上的二维码的坐标系
-                    img_pts, _ = cv2.projectPoints(temp, tag_obj_result[0][:3, :3],
-                                                   tag_obj_result[0][:3, 3], K, distCoeffs=distCoeffs)
-                    draw_image_points(laptop_frame, img_pts)
-                iou = compute_iou(get_convex_hull(temp), get_convex_hull(virtual_obj_3d_corners))
-                image_text = "iou: %.2f" % iou
-                draw_text(laptop_frame, image_text, 200, show_text)
-
-                distance_between_2tags *= 100
-                distance_between_2tags = (9 - distance_between_2tags) + 9 if distance_between_2tags < 9 else distance_between_2tags
-                distance_reward = 0.6 * np.exp(-0.12 * (distance_between_2tags - 9))
-                euler_sum = np.sum(np.abs(eulerangles))
-                euler_reward = 0.2 * (1 - euler_sum / 45) if distance_between_2tags < 13 and euler_sum < 45 else 0
-                iou_reward = 0.2 * iou
-                total_reward = distance_reward + euler_reward + iou_reward
-                image_text = ("reward: %.2f, dis_reward: %.2f, eul_reward: %.2f, iou_reward: %.2f"
-                              % (total_reward, distance_reward, euler_reward, iou_reward))
-                draw_text(laptop_frame, image_text, 250, show_text)
+                #print(np.concatenate((trans_between_2tags, eulerangles)))
+        if policy is not None:
+            # pred_action = predict_action(
+            #    observation, policy, get_safe_torch_device(policy.config.device), policy.config.use_amp
+            # )
+            observation['desired_goal'] = torch.tensor([-4.57481870e-03,-9.22452551e-02, 5.56919394e-02,-6.21978684e+00,
+ -2.94220078e+00,-8.39413667e-01]).view(1, -1)
+            observation['observation.state'] = observation['observation.state'].view(1, -1)
+            for name in observation:
+                observation[name] = observation[name].to(torch.device('cuda:0'))
+            with torch.no_grad():
+                prediction = policy(observation)
+            # Action can eventually be clipped using `max_relative_target`,
+            # so action actually sent is saved in the dataset.
+            action = robot.send_action(prediction.squeeze().cpu())
+            # print(pred_action)
+            action = {"action": action}
 
         if dataset is not None:
             frame = {**observation, **action, "task": single_task,
-                     'reward': np.array([total_reward], dtype=np.float32)}
+                     'achieved_goal': np.array(np.concatenate((trans_between_2tags, eulerangles)), dtype=np.float32)}
             dataset.add_frame(frame)
 
         if display_cameras and not is_headless():

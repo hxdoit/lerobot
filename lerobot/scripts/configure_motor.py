@@ -134,9 +134,11 @@ def configure_motor(port, brand, model, motor_idx_des, baudrate_des):
         print(f"Setting its index to desired index {motor_idx_des}")
         if brand == "feetech":
             motor_bus.write_with_motor_ids(motor_bus.motor_models, motor_index, "Lock", 0)
+        #print("abc")
         motor_bus.write_with_motor_ids(motor_bus.motor_models, motor_index, "ID", motor_idx_des)
-
+        #print("def")
         present_idx = motor_bus.read_with_motor_ids(motor_bus.motor_models, motor_idx_des, "ID", num_retry=2)
+        #print("ghi %s" % present_idx)
         if present_idx != motor_idx_des:
             raise OSError("Failed to write index.")
 

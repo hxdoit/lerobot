@@ -92,8 +92,8 @@ class ACTConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 25
-    n_action_steps: int = 25
+    chunk_size: int = 1
+    n_action_steps: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -175,12 +175,16 @@ class ACTConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
-        return [0, 25]
+        return [0, 1] # cur,next
 
     @property
     def action_delta_indices(self) -> list:
         return list(range(self.chunk_size))
 
     @property
+    def achieved_goal_delta_indices(self) -> None:
+        return [0, 1] # cur,next
+
+    @property
     def reward_delta_indices(self) -> None:
-        return list(range(self.chunk_size + 1))
+        return [0, 1]  # cur,next

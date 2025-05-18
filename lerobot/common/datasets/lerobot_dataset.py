@@ -351,6 +351,9 @@ class LeRobotDatasetMetadata:
         return obj
 
 
+def get_multi_items(arr, indices):
+        return torch.stack(([arr[i] for i in indices]).copy())
+
 class LeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -503,6 +506,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset = self.load_hf_dataset()
 
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
+        self.n_episodes_stored = self.episode_data_index['from'].shape[0]
+        self.her_ratio = 0.8
+        self.episode_lengths = self.episode_data_index['to'] - self.episode_data_index['from']
 
         # Check timestamps
         timestamps = torch.stack(self.hf_dataset["timestamp"]).numpy()
@@ -514,6 +520,47 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.delta_timestamps is not None:
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+
+    def sample(self, batch_size):
+        episode_indices = np.random.randint(0, self.n_episodes_stored, batch_size)
+        her_indices = np.arange(batch_size)[: int(self.her_ratio * batch_size)]
+        ep_lengths = self.episode_lengths[episode_indices]
+        ep_lengths -= 1
+        transitions_indices = np.random.randint(ep_lengths)
+
+        together_idx = self.episode_data_index['from'][episode_indices] + transitions_indices
+        next_together_idx = together_idx + 1
+
+        transitions = {key: get_multi_items(self.hf_dataset[key], together_idx) for key in
+                       self.hf_dataset.features.keys()}
+        next_transitions = {key: get_multi_items(self.hf_dataset[key], next_together_idx) for key in
+                       self.hf_dataset.features.keys()}
+
+        new_goals = self.sample_goals(episode_indices, her_indices, transitions_indices)
+
+        transitions["desired_goal"] = torch.zeros_like(transitions["achieved_goal"])
+        transitions["desired_goal"][her_indices] = new_goals
+        next_transitions["desired_goal"] = torch.zeros_like(next_transitions["achieved_goal"])
+        next_transitions["desired_goal"][her_indices] = new_goals
+        transitions["reward"] = torch.zeros_like(transitions["timestamp"]) - 1
+        close_2_goal_flag = torch.sqrt(torch.sum((next_transitions['achieved_goal'][:, :3] - transitions['desired_goal'][:, :3])**2, dim=1)) < 0.03
+        transitions["reward"][close_2_goal_flag] = 0
+
+        return (transitions, next_transitions)
+
+    def sample_goals(
+        self,
+        episode_indices: np.ndarray,
+        her_indices: np.ndarray,
+        transitions_indices: np.ndarray,
+    ):
+        her_episode_indices = episode_indices[her_indices]
+
+        transitions_indices_new = np.random.randint(
+            transitions_indices[her_indices] + 1, self.episode_lengths[her_episode_indices]
+        )
+        together_idx_new = self.episode_data_index['from'][her_episode_indices] + transitions_indices_new
+        return get_multi_items(self.hf_dataset["achieved_goal"], together_idx_new)
 
     def push_to_hub(
         self,

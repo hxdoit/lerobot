@@ -14,18 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import threading
 import time
+from collections import deque
 from contextlib import nullcontext
 from itertools import zip_longest
+from multiprocessing import Process
+from os import mkdir
 from pprint import pformat
-from typing import Any, Iterable
-
+from typing import Any, Iterable, List, Type
+import torch as th
 import safetensors
 import torch
 from termcolor import colored
 from torch.amp import GradScaler
+import torch.optim as optim
 from torch.optim import Optimizer
-
+from torch import nn
+import torch.nn.functional as F
 from lerobot.common.datasets.factory import make_dataset
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
@@ -82,166 +88,178 @@ def polyak_update(
             target_param.data.mul_(1 - tau)
             torch.add(target_param.data, param.data, alpha=tau, out=target_param.data)
 
+def create_mlp(
+    input_dim: int,
+    output_dim: int,
+    net_arch: List[int],
+    activation_fn: Type[nn.Module] = nn.ReLU,
+    squash_output: bool = False,
+):
+
+    if len(net_arch) > 0:
+        modules = [nn.Linear(input_dim, net_arch[0]), activation_fn()]
+    else:
+        modules = []
+
+    for idx in range(len(net_arch) - 1):
+        modules.append(nn.Linear(net_arch[idx], net_arch[idx + 1]))
+        modules.append(activation_fn())
+
+    if output_dim > 0:
+        last_layer_dim = net_arch[-1] if len(net_arch) > 0 else input_dim
+        modules.append(nn.Linear(last_layer_dim, output_dim))
+    if squash_output:
+        modules.append(nn.Tanh())
+    return modules
+
+class Actor(nn.Module):
+    def __init__(
+        self,
+    ):
+        super(Actor, self).__init__()
+
+        self.net_arch = [400, 300]
+        self.features_dim = 6 + 3 # 6 angles + desired goal(xyz)
+
+        self.action_dim = 6 # 6 angles
+        actor_net = create_mlp(self.features_dim, self.action_dim, self.net_arch, squash_output=True)
+        self.mu = nn.Sequential(*actor_net)
+        self.mean = torch.tensor([-27.4765,  86.3493,  92.4536,  67.2350,   5.4615,  -0.2023]).to('cuda:0')
+        self.std = torch.tensor([10.0312, 33.6212, 30.0723,  7.6640, 12.1933,  0.2019]).to('cuda:0')
+
+    def forward(self, obs):
+        state = obs['observation.state']
+        state = (state - self.mean) / (self.std + 1e-8)
+        features = torch.cat((state, obs['desired_goal'][:, :3]), dim=1)
+        actions = self.mu(features)
+        return actions * self.std + self.mean
+
+class Critic(nn.Module):
+    def __init__(
+        self,
+    ):
+        super().__init__()
+
+        self.action_dim = 6 # 6 angles
+        self.features_dim = 6 + 3  # 6 angles + desired goal(xyz)
+        self.net_arch = [400, 300]
+        self.n_critics = 2
+        self.q_networks = []
+        self.mean = torch.tensor([-27.4765, 86.3493, 92.4536, 67.2350, 5.4615, -0.2023]).to('cuda:0')
+        self.std = torch.tensor([10.0312, 33.6212, 30.0723, 7.6640, 12.1933, 0.2019]).to('cuda:0')
+        for idx in range(self.n_critics):
+            q_net = create_mlp(self.features_dim + self.action_dim, 1, self.net_arch)
+            q_net = nn.Sequential(*q_net)
+            self.add_module(f"qf{idx}", q_net)
+            self.q_networks.append(q_net)
+
+    def forward(self, obs, action):
+        state = obs['observation.state']
+        state = (state - self.mean) / (self.std + 1e-8)
+        action = (action - self.mean) / (self.std + 1e-8)
+        qvalue_input = th.cat([state, obs['desired_goal'][:, :3], action], dim=1)
+        return tuple(q_net(qvalue_input) for q_net in self.q_networks)
+
+    def q1_forward(self, obs, action):
+        state = obs['observation.state']
+        state = (state - self.mean) / (self.std + 1e-8)
+        action = (action - self.mean) / (self.std + 1e-8)
+        return self.q_networks[0](th.cat([state, obs['desired_goal'][:, :3], action], dim=1))
 
 class Td3Policy(torch.nn.Module):
     def __init__(self, cfg, dataset, *args, **kwargs):
         super().__init__(*args, **kwargs)
         device = get_safe_torch_device(cfg.policy.device, log=True)
-        self.actor = make_policy(
-            cfg=cfg.policy,
-            ds_meta=dataset.meta,
-        )
-        safetensors.torch.load_model(self.actor,
-                                      'outputs/train/act_so100_rl2/checkpoints/060000/pretrained_model/actor/model.safetensors',
-                                      'cuda:0', False)
-        self.actor_target = make_policy(
-            cfg=cfg.policy,
-            ds_meta=dataset.meta,
-        )
-        self.actor_target.model.load_state_dict(self.actor.model.state_dict())
+        lr = 1e-5
+        self.actor = Actor()
+        self.actor_target = Actor()
+        self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor_target.train(False)
         for p in (self.actor_target.parameters()):
             p.requires_grad = False
-        self.actor_optimizer, self.actor_lr_scheduler = make_optimizer_and_scheduler(cfg, self.actor)
-        self.actor_grad_scaler = GradScaler(device.type, enabled=cfg.policy.use_amp)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
 
-        self.critic = make_policy(
-            cfg=cfg.policy,
-            ds_meta=dataset.meta,
-            type='critic'
-        )
-        #polyak_update(self.actor.feature_extract_params(), self.critic.feature_extract_params(), 1)
-        safetensors.torch.load_model(self.critic,
-                                     'outputs/train/act_so100_rl2/checkpoints/060000/pretrained_model/critic/model.safetensors',
-                                     'cuda:0', False)
-        #safetensors.torch.load_model(self.actor,
-        #                             'outputs/train/act_so100_rl/checkpoints/080000/pretrained_model/model.safetensors',
-        #                             'cuda:0', False)
-        #self.critic.copy_from_actor(self.actor)
-        self.critic_target = make_policy(
-            cfg=cfg.policy,
-            ds_meta=dataset.meta,
-            type='critic'
-        )
-        #self.critic_target.copy_from_actor(self.actor_target)
-        self.critic_target.model.load_state_dict(self.critic.model.state_dict())
+        self.critic = Critic()
+        self.critic_target = Critic()
+        self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.train(False)
         for p in (self.critic_target.parameters()):
             p.requires_grad = False
-        self.critic_optimizer, self.critic_lr_scheduler = make_optimizer_and_scheduler(cfg, self.critic)
-        self.critic_grad_scaler = GradScaler(device.type, enabled=cfg.policy.use_amp)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr)
 
     def save_pretrained(self, pretrained_dir):
-        self.actor.save_pretrained(pretrained_dir / 'actor')
-        self.critic.save_pretrained(pretrained_dir / 'critic')
+        pretrained_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.actor, pretrained_dir / 'actor.pth')
+        torch.save(self.critic, pretrained_dir / 'critic.pth')
 
-import torch.nn.functional as F
+
+
+from multiprocessing import Queue
+dq = Queue(maxsize=50)
+
+def process_task(dataset, que):
+    count = 0
+    while True:
+        while que.full():
+            time.sleep(0.05)
+        now = time.time()
+        batch_tuple = dataset.sample(100)
+        que.put(batch_tuple)
+        count += 1
 
 def update_policy(
     cur_step,
     train_metrics: MetricsTracker,
     policy,
-    batch: Any,
+    batch_tuple: Any,
     grad_clip_norm: float,
     use_amp: bool = False,
     lock=None,
 ) -> tuple[MetricsTracker, dict]:
-    cur_batch = {
-        'observation.images.laptop': batch['observation.images.laptop'][:, 0],
-        'observation.images.phone': batch['observation.images.phone'][:, 0],
-        'observation.state': batch['observation.state'][:, 0],
-        'action_is_pad': batch['action_is_pad'],
-        'reward_is_pad': batch['reward_is_pad'],
-        'action': batch['action'],
-        'reward': batch['reward'],
-    }
-    next_batch = {
-        'observation.images.laptop': batch['observation.images.laptop'][:, 1],
-        'observation.images.phone': batch['observation.images.phone'][:, 1],
-        'observation.state': batch['observation.state'][:, 1],
-        'action_is_pad': batch['action_is_pad'],
-        'reward_is_pad': batch['reward_is_pad'],
-        'action': batch['action'],
-        'reward': batch['reward']
-    }
+    cur_batch = batch_tuple[0]
+    next_batch = batch_tuple[1]
     gamma = 0.99
     tau = 0.005
     start_time = time.perf_counter()
     with torch.no_grad():
-        _, _, next_actions = policy.actor_target(next_batch)
+        next_actions = policy.actor_target(next_batch)
 
         # Compute the next Q-values: min over all critics targets
-        next_q_values = torch.cat(policy.critic_target.q_forward(next_batch, next_actions), dim=1)
+        next_q_values = torch.cat(policy.critic_target(next_batch, next_actions), dim=1)
         next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
-        cur_reward = (cur_batch['reward'][:, 1:] - cur_batch['reward'][:, :25])
-        target_q_values = torch.sum(cur_reward, dim=1, keepdim=True) + gamma * next_q_values
+        target_q_values = cur_batch['reward'].view(-1, 1) + gamma * next_q_values
 
     # Get current Q-values estimates for each critic network
-    current_q_values = policy.critic.q_forward(cur_batch, cur_batch['action'])
+    current_q_values = policy.critic(cur_batch, cur_batch['action'])
     train_metrics.critic_q0 = torch.mean(current_q_values[0]).cpu().item()
     train_metrics.critic_q1 = torch.mean(current_q_values[1]).cpu().item()
 
     # Compute critic loss
     critic_loss = sum([F.mse_loss(current_q, target_q_values) for current_q in current_q_values])
-
+    train_metrics.critic_loss = critic_loss.cpu().item()
     # Optimize the critics
     policy.critic_optimizer.zero_grad()
-    #critic_loss.backward()
-    #policy.critic_optimizer.step()
-
-    policy.critic_grad_scaler.scale(critic_loss).backward()
-
-    # Unscale the gradient of the optimizer's assigned params in-place **prior to gradient clipping**.
-    policy.critic_grad_scaler.unscale_(policy.critic_optimizer)
-    grad_norm_critic = torch.nn.utils.clip_grad_norm_(
-        policy.critic.parameters(),
-        grad_clip_norm,
-        error_if_nonfinite=False,
-    )
-
-    policy.critic_grad_scaler.step(policy.critic_optimizer)
-    # Updates the scale for next iteration.
-    policy.critic_grad_scaler.update()
+    critic_loss.backward()
+    policy.critic_optimizer.step()
 
     # Delayed policy updates
     #actor_loss = torch.tensor([0.0]).to('cuda:0')
     if cur_step % 2 == 0:
         # Compute actor loss
-        _,_,next_actions = policy.actor(cur_batch)
+        next_actions = policy.actor(cur_batch)
         actor_loss = -policy.critic.q1_forward(cur_batch, next_actions).mean()
 
         # Optimize the actor
         policy.actor_optimizer.zero_grad()
-        #actor_loss.backward()
-        #policy.actor_optimizer.step()
+        actor_loss.backward()
+        policy.actor_optimizer.step()
 
-        policy.actor_grad_scaler.scale(actor_loss).backward()
-
-        # Unscale the gradient of the optimizer's assigned params in-place **prior to gradient clipping**.
-        policy.actor_grad_scaler.unscale_(policy.actor_optimizer)
-        grad_norm_actor = torch.nn.utils.clip_grad_norm_(
-            policy.actor.parameters(),
-            grad_clip_norm,
-            error_if_nonfinite=False,
-        )
-        train_metrics.grad_norm_actor = grad_norm_actor.cpu().item()
         train_metrics.actor_loss = actor_loss.cpu().item()
 
-        policy.actor_grad_scaler.step(policy.actor_optimizer)
-        # Updates the scale for next iteration.
-        policy.actor_grad_scaler.update()
-
-        polyak_update(policy.actor.feature_extract_params(), policy.critic.feature_extract_params(), 1)
         polyak_update(policy.critic.parameters(), policy.critic_target.parameters(), tau)
         polyak_update(policy.actor.parameters(), policy.actor_target.parameters(), tau)
 
-    #policy.train()
 
-
-
-
-    train_metrics.critic_loss = critic_loss.cpu().item()
-    train_metrics.grad_norm_critic = grad_norm_critic.cpu().item()
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics
 
@@ -312,26 +330,13 @@ def train(cfg: TrainPipelineConfig):
         shuffle = True
         sampler = None
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        pin_memory=device.type != "cpu",
-        drop_last=False,
-    )
-    dl_iter = cycle(dataloader)
 
-    #td3policy.train()
 
     train_metrics = {
         "actor_loss": AverageMeter("actor_loss", ":.4f"),
         "critic_loss": AverageMeter("critic_loss", ":.4f"),
         "critic_q0": AverageMeter("critic_q0", ":.4f"),
         "critic_q1": AverageMeter("critic_q1", ":.4f"),
-        "grad_norm_actor": AverageMeter("grad_norm_actor", ":.3f"),
-        "grad_norm_critic": AverageMeter("grad_norm_critic", ":.3f"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
@@ -340,21 +345,33 @@ def train(cfg: TrainPipelineConfig):
         cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
     )
 
+    global dq
+    processnum = 16
+    processes = []
+    for pidx in range(processnum):
+        p = Process(target=process_task, args=(dataset, dq))
+        p.start()
+        processes.append(p)
+
+
     logging.info("Start offline training on a fixed dataset")
     for cur_step in range(step, cfg.steps):
         start_time = time.perf_counter()
-        batch = next(dl_iter)
+        while dq.empty():
+            time.sleep(0.05)
+        batch_tuple = dq.get()
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        for key in batch:
-            if isinstance(batch[key], torch.Tensor):
-                batch[key] = batch[key].to(device, non_blocking=True)
+        for batch in batch_tuple:
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device, non_blocking=True)
 
         train_tracker = update_policy(
             cur_step,
             train_tracker,
             td3policy,
-            batch,
+            batch_tuple,
             cfg.optimizer.grad_clip_norm,
             use_amp=cfg.policy.use_amp,
         )
@@ -374,10 +391,12 @@ def train(cfg: TrainPipelineConfig):
         if cfg.save_checkpoint and is_saving_step:
             logging.info(f"Checkpoint policy after step {step}")
             checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-            save_td3_checkpoint(checkpoint_dir, step, cfg, td3policy)
+            td3policy.save_pretrained(checkpoint_dir)
 
 
     logging.info("End of training")
+    for data_process in processes:
+        data_process.join()
 
 
 if __name__ == "__main__":

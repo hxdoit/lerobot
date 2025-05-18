@@ -83,15 +83,15 @@ class OpenVLAServer:
             with open(Path(self.openvla_path) / "dataset_statistics.json", "r") as f:
                 self.vla.norm_stats = json.load(f)
 
-    def predict_action(self, lang, image):
+    def predict_action(self, lang, image, state):
         try:
 
             # Run VLA Inference
             prompt = get_openvla_prompt(lang, self.openvla_path)
-            #image = Image.open("/home/ubuntu/Downloads/openvla/cmu_stretch_videos/video_0/frame_6.png").convert("RGB")
             inputs = self.processor(prompt, image).to(self.device, dtype=torch.bfloat16)
             actions = self.vla.predict_action(**inputs, unnorm_key='lerobot_dataset', do_sample=False)
-            actions = actions[:6]
+            print(actions)
+            actions = actions[:6] + state
             a_min = [-0.212890625,
                      0.18896484375,
                      0.14013671875,
@@ -110,8 +110,8 @@ class OpenVLAServer:
             a_max = [x * 180 + 20 for x in a_max]
 
             if np.any(actions < a_min) or np.any(actions > a_max):
-                raise ValueError("actions out of range")
-                #pass
+                #raise ValueError("actions out of range")
+                pass
             return actions
         except:  # noqa: E722
             logging.error(traceback.format_exc())
@@ -131,9 +131,9 @@ class OpenVLAServer:
 def record(
     robot: Robot
 ) -> LeRobotDataset:
-    server = OpenVLAServer("/home/ubuntu/Downloads/lerobot/iter500_400_400_400")
+    server = OpenVLAServer("/home/ubuntu/Downloads/lerobot/iter1600")
 
-    fps = 0.5
+    fps = 5
     if not robot.is_connected:
         robot.connect()
     control_time_s = float("inf")
@@ -147,8 +147,8 @@ def record(
 
         img_right = observation['observation.images.phone']
         img = PImage.fromarray(img_right.numpy())
-        lang = 'Put the yellow toy block in a stainless steel bowl.'
-        action = server.predict_action(lang, img)
+        lang = 'put the yellow toy block in a stainless steel bowl'
+        action = server.predict_action(lang, img, observation['observation.state'].numpy())
         print(action)
         robot.send_action(torch.tensor(action))
 

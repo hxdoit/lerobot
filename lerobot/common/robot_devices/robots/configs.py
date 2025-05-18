@@ -483,7 +483,7 @@ class So100RobotConfig(ManipulatorRobotConfig):
                 height=720,
             ),
             "phone": OpenCVCameraConfig(
-                camera_index=2,
+                camera_index=3,
                 fps=10,
                 width=1280,
                 height=720,
