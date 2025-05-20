@@ -14,8 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import copy
 import logging
+import random
 import shutil
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -504,7 +507,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.revision = get_safe_version(self.repo_id, self.revision)
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
-
+        self.hf_dataset_bak = []
+        for ds_idx in range(len(self.hf_dataset)):
+            self.hf_dataset_bak.append(self.hf_dataset[ds_idx])
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         self.n_episodes_stored = self.episode_data_index['from'].shape[0]
         self.her_ratio = 0.8
@@ -769,33 +774,40 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
-        item = self.hf_dataset[idx]
-        ep_idx = item["episode_index"].item()
+        target_episode_idx = 0
+        for eisode_idx in range(len(self.episode_data_index['from'])):
+            if idx >= self.episode_data_index['from'][eisode_idx] and idx < self.episode_data_index['to'][eisode_idx] - 1:
+                target_episode_idx = eisode_idx
+                break
+            elif idx == self.episode_data_index['to'][eisode_idx] - 1:
+                idx -= 1
+                target_episode_idx = eisode_idx
+                break
 
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
+        need_her = random.random() < self.her_ratio
+        next_idx = idx + 1
 
-        if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-            item = {**video_frames, **item}
+        transition = copy.deepcopy(self.hf_dataset_bak[idx])
+        next_transition = copy.deepcopy(self.hf_dataset_bak[next_idx])
 
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+        transition["desired_goal"] = torch.zeros_like(transition["achieved_goal"])
+        next_transition["desired_goal"] = torch.zeros_like(next_transition["achieved_goal"])
+        if need_her:
+            goal_idx = np.random.randint(
+                idx + 1, self.episode_data_index['to'][target_episode_idx]
+            )
+            goal_item = self.hf_dataset["achieved_goal"][goal_idx]
+            transition["desired_goal"] = goal_item
+            next_transition["desired_goal"] = goal_item
 
-        # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks[task_idx]
-
-        return item
+        transition["reward"] = torch.tensor(-1)
+        close_2_goal_flag = torch.sqrt(
+            torch.sum((next_transition['achieved_goal'][:3] - transition['desired_goal'][:3]) ** 2,
+                      dim=0)) < 0.03
+        transition["reward"][close_2_goal_flag] = 0
+        transition['next_observation.state'] = next_transition['observation.state']
+        transition['next_achieved_goal'] = next_transition['achieved_goal']
+        return transition
 
     def __repr__(self):
         feature_keys = list(self.features)
@@ -1246,7 +1258,6 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         for data_key in self.disabled_features:
             if data_key in item:
                 del item[data_key]
-
         return item
 
     def __repr__(self):

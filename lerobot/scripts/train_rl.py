@@ -22,6 +22,7 @@ from itertools import zip_longest
 from multiprocessing import Process
 from os import mkdir
 from pprint import pformat
+import random
 from typing import Any, Iterable, List, Type
 import torch as th
 import safetensors
@@ -60,6 +61,7 @@ from lerobot.common.utils.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts.eval import eval_policy
+import copy
 def zip_strict(*iterables: Iterable) -> Iterable:
     r"""
     ``zip()`` function but enforces that iterables are of equal length.
@@ -193,20 +195,6 @@ class Td3Policy(torch.nn.Module):
         torch.save(self.critic, pretrained_dir / 'critic.pth')
 
 
-
-from multiprocessing import Queue
-dq = Queue(maxsize=50)
-
-def process_task(dataset, que):
-    count = 0
-    while True:
-        while que.full():
-            time.sleep(0.05)
-        now = time.time()
-        batch_tuple = dataset.sample(100)
-        que.put(batch_tuple)
-        count += 1
-
 def update_policy(
     cur_step,
     train_metrics: MetricsTracker,
@@ -221,8 +209,11 @@ def update_policy(
     gamma = 0.99
     tau = 0.005
     start_time = time.perf_counter()
+
     with torch.no_grad():
-        next_actions = policy.actor_target(next_batch)
+        noise = next_batch['action'].clone().data.normal_(0, 0.2)
+        noise = noise.clamp(-0.5, 0.5)
+        next_actions = policy.actor_target(next_batch) + noise
 
         # Compute the next Q-values: min over all critics targets
         next_q_values = torch.cat(policy.critic_target(next_batch, next_actions), dim=1)
@@ -264,6 +255,20 @@ def update_policy(
     return train_metrics
 
 
+from multiprocessing import Queue
+dq = Queue(maxsize=50)
+def process_task(dataset, que):
+    random.seed(random.randint(1, 1000))
+    count = 0
+    while True:
+        while que.full():
+            time.sleep(0.05)
+        batch_tuple = dataset.sample(100)
+        que.put(batch_tuple)
+        count += 1
+
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
@@ -299,12 +304,7 @@ def train(cfg: TrainPipelineConfig):
     td3policy = Td3Policy(cfg, dataset)
     td3policy.to(device)
 
-
-
     step = 0  # number of policy updates (forward + backward + optim)
-
-    #if cfg.resume:
-    #    step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
     num_learnable_params = sum(p.numel() for p in td3policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in td3policy.parameters())
@@ -318,19 +318,13 @@ def train(cfg: TrainPipelineConfig):
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.episode_data_index,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
-
-
+    global dq
+    processnum = 16
+    processes = []
+    for pidx in range(processnum):
+        p = Process(target=process_task, args=(dataset, dq))
+        p.start()
+        processes.append(p)
 
     train_metrics = {
         "actor_loss": AverageMeter("actor_loss", ":.4f"),
@@ -345,14 +339,6 @@ def train(cfg: TrainPipelineConfig):
         cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
     )
 
-    global dq
-    processnum = 16
-    processes = []
-    for pidx in range(processnum):
-        p = Process(target=process_task, args=(dataset, dq))
-        p.start()
-        processes.append(p)
-
 
     logging.info("Start offline training on a fixed dataset")
     for cur_step in range(step, cfg.steps):
@@ -360,8 +346,8 @@ def train(cfg: TrainPipelineConfig):
         while dq.empty():
             time.sleep(0.05)
         batch_tuple = dq.get()
-        train_tracker.dataloading_s = time.perf_counter() - start_time
 
+        train_tracker.dataloading_s = time.perf_counter() - start_time
         for batch in batch_tuple:
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
