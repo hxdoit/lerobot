@@ -262,29 +262,7 @@ def create_mlp(
     if squash_output:
         modules.append(nn.Tanh())
     return modules
-
-class Actor(nn.Module):
-    def __init__(
-        self,
-    ):
-        super(Actor, self).__init__()
-
-        self.net_arch = [400, 300]
-        self.features_dim = 6 + 3 # 6 angles + desired goal(xyz)
-
-        self.action_dim = 6 # 6 angles
-        actor_net = create_mlp(self.features_dim, self.action_dim, self.net_arch, squash_output=True)
-        self.mu = nn.Sequential(*actor_net)
-        self.mean = torch.tensor([-27.4765,  86.3493,  92.4536,  67.2350,   5.4615,  -0.2023]).to('cuda:0')
-        self.std = torch.tensor([10.0312, 33.6212, 30.0723,  7.6640, 12.1933,  0.2019]).to('cuda:0')
-
-    def forward(self, obs):
-        state = obs['observation.state']
-        state = (state - self.mean) / (self.std + 1e-8)
-        features = torch.cat((state, obs['desired_goal'][:, :3]), dim=1)
-        actions = self.mu(features)
-        return actions * self.std + self.mean
-
+from lerobot.scripts.train_rl_actor import Actor
 #python lerobot/scripts/control_robot.py   --robot.type=so100   --control.type=record   --control.fps=30   --control.single_task="Put the yellow toy block in a stainless steel bowl."   --control.repo_id=hxdoso/so100_test   --control.tags='["so100","tutorial"]'   --control.warmup_time_s=5   --control.episode_time_s=300   --control.reset_time_s=30   --control.num_episodes=1 --control.resume=true
 @safe_disconnect
 def record(
@@ -318,7 +296,7 @@ def record(
 
     # Load pretrained policy
     #policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
-    policy = torch.load('outputs5/train/act_so100_rl6/checkpoints/040000/actor.pth', weights_only=False)
+    policy = torch.load('outputs/train/act_so100_rl7/checkpoints/006000/actor.pth', weights_only=False)
     policy.to(torch.device('cuda:0'))
 
     if not robot.is_connected:
@@ -378,7 +356,7 @@ def record(
             break
 
     observation = robot.capture_observation()
-    joint_targets = np.linspace(observation['observation.state'], [-0.9667969, 195.55664, 176.3086, 64.95117, -10.458984, 0.5028736], 100)
+    joint_targets = np.linspace(observation['observation.state'], [ -5.3613, 158.7305, 157.7637,  59.9414,  -8.4375,  -0.7184], 100)
     for target in joint_targets:
         robot.send_action(target)
         time.sleep(0.03)

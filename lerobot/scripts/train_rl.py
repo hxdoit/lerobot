@@ -121,20 +121,20 @@ class Actor(nn.Module):
         super(Actor, self).__init__()
 
         self.net_arch = [400, 300]
-        self.features_dim = 6 + 3 # 6 angles + desired goal(xyz)
+        self.features_dim = 6 # 6 angles
 
         self.action_dim = 6 # 6 angles
-        actor_net = create_mlp(self.features_dim, self.action_dim, self.net_arch, squash_output=True)
+        actor_net = create_mlp(self.features_dim, self.action_dim, self.net_arch, squash_output=False)
         self.mu = nn.Sequential(*actor_net)
         self.mean = torch.tensor([-27.4765,  86.3493,  92.4536,  67.2350,   5.4615,  -0.2023]).to('cuda:0')
         self.std = torch.tensor([10.0312, 33.6212, 30.0723,  7.6640, 12.1933,  0.2019]).to('cuda:0')
 
     def forward(self, obs):
         state = obs['observation.state']
-        state = (state - self.mean) / (self.std + 1e-8)
-        features = torch.cat((state, obs['desired_goal'][:, :3]), dim=1)
-        actions = self.mu(features)
-        return actions * self.std + self.mean
+        #state = (state - self.mean) / (self.std + 1e-8)
+        actions = self.mu(state)
+        #return actions * self.std + self.mean
+        return actions
 
 class Critic(nn.Module):
     def __init__(
@@ -143,7 +143,7 @@ class Critic(nn.Module):
         super().__init__()
 
         self.action_dim = 6 # 6 angles
-        self.features_dim = 6 + 3  # 6 angles + desired goal(xyz)
+        self.features_dim = 6  # 6 angles
         self.net_arch = [400, 300]
         self.n_critics = 2
         self.q_networks = []
@@ -157,16 +157,25 @@ class Critic(nn.Module):
 
     def forward(self, obs, action):
         state = obs['observation.state']
-        state = (state - self.mean) / (self.std + 1e-8)
-        action = (action - self.mean) / (self.std + 1e-8)
-        qvalue_input = th.cat([state, obs['desired_goal'][:, :3], action], dim=1)
+        #state = (state - self.mean) / (self.std + 1e-8)
+        #action = (action - self.mean) / (self.std + 1e-8)
+        qvalue_input = th.cat([state, action], dim=1)
         return tuple(q_net(qvalue_input) for q_net in self.q_networks)
+
+    def init(self):
+        for q_net in self.q_networks:
+            for module in q_net.modules():
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
+
 
     def q1_forward(self, obs, action):
         state = obs['observation.state']
-        state = (state - self.mean) / (self.std + 1e-8)
-        action = (action - self.mean) / (self.std + 1e-8)
-        return self.q_networks[0](th.cat([state, obs['desired_goal'][:, :3], action], dim=1))
+        #state = (state - self.mean) / (self.std + 1e-8)
+        #action = (action - self.mean) / (self.std + 1e-8)
+        return self.q_networks[0](th.cat([state, action], dim=1))
 
 class Td3Policy(torch.nn.Module):
     def __init__(self, cfg, dataset, *args, **kwargs):
@@ -174,6 +183,7 @@ class Td3Policy(torch.nn.Module):
         device = get_safe_torch_device(cfg.policy.device, log=True)
         lr = 1e-5
         self.actor = Actor()
+        self.actor = torch.load('outputs/train/act_so100_rl6/checkpoints/200000/actor.pth', weights_only=False)
         self.actor_target = Actor()
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor_target.train(False)
@@ -182,6 +192,8 @@ class Td3Policy(torch.nn.Module):
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
 
         self.critic = Critic()
+        #self.critic.init()
+        self.critic = torch.load('outputs/train/act_so100_rl7/checkpoints/002400/critic.pth', weights_only=False)
         self.critic_target = Critic()
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.train(False)
@@ -218,7 +230,7 @@ def update_policy(
         # Compute the next Q-values: min over all critics targets
         next_q_values = torch.cat(policy.critic_target(next_batch, next_actions), dim=1)
         next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
-        target_q_values = cur_batch['reward'].view(-1, 1) + gamma * next_q_values
+        target_q_values = cur_batch['reward'].view(-1, 1) + (1 - cur_batch['done'].view(-1, 1)) * gamma * next_q_values
 
     # Get current Q-values estimates for each critic network
     current_q_values = policy.critic(cur_batch, cur_batch['action'])

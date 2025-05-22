@@ -528,28 +528,21 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def sample(self, batch_size):
         episode_indices = np.random.randint(0, self.n_episodes_stored, batch_size)
-        her_indices = np.arange(batch_size)[: int(self.her_ratio * batch_size)]
         ep_lengths = self.episode_lengths[episode_indices]
         ep_lengths -= 1
         transitions_indices = np.random.randint(ep_lengths)
 
         together_idx = self.episode_data_index['from'][episode_indices] + transitions_indices
         next_together_idx = together_idx + 1
+        dones = next_together_idx > self.episode_data_index['to'][episode_indices] - 10
 
         transitions = {key: get_multi_items(self.hf_dataset[key], together_idx) for key in
                        self.hf_dataset.features.keys()}
         next_transitions = {key: get_multi_items(self.hf_dataset[key], next_together_idx) for key in
                        self.hf_dataset.features.keys()}
 
-        new_goals = self.sample_goals(episode_indices, her_indices, transitions_indices)
-
-        transitions["desired_goal"] = torch.zeros_like(transitions["achieved_goal"])
-        transitions["desired_goal"][her_indices] = new_goals
-        next_transitions["desired_goal"] = torch.zeros_like(next_transitions["achieved_goal"])
-        next_transitions["desired_goal"][her_indices] = new_goals
-        transitions["reward"] = torch.zeros_like(transitions["timestamp"]) - 1
-        close_2_goal_flag = torch.sqrt(torch.sum((next_transitions['achieved_goal'][:, :3] - transitions['desired_goal'][:, :3])**2, dim=1)) < 0.03
-        transitions["reward"][close_2_goal_flag] = 0
+        transitions["reward"] = next_transitions['reward'] - transitions['reward']
+        transitions["done"] = dones.type(torch.int8)
 
         return (transitions, next_transitions)
 

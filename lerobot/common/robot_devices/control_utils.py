@@ -311,20 +311,24 @@ def control_loop(
     camera_name = 'desktop'
     tag_obj_id = 11
     tag_size = 0.017  # m
+    # 目标物体的size
+    obj_width = 0.03
+    obj_height = 0.03
+    obj_length = 0.056
 
     show_obj_tag_cube = True
     show_grasp_tag_cube = True
     show_text = True
 
-    tag_3d_corners = np.array([
-        [-tag_size / 2, -tag_size / 2, 0],  # 左下前
-        [tag_size / 2, -tag_size / 2, 0],  # 右下前
-        [tag_size / 2, tag_size / 2, 0],  # 右上前
-        [-tag_size / 2, tag_size / 2, 0],  # 左上前
-        [-tag_size / 2, -tag_size / 2, tag_size],  # 左下后
-        [tag_size / 2, -tag_size / 2, tag_size],  # 右下后
-        [tag_size / 2, tag_size / 2, tag_size],  # 右上后
-        [-tag_size / 2, tag_size / 2, tag_size]  # 左上后
+    virtual_obj_3d_corners = np.array([
+        [-obj_width / 2, -obj_length / 2, -obj_height / 2],  # 左下前
+        [obj_width / 2, -obj_length / 2, -obj_height / 2],  # 右下前
+        [obj_width / 2, obj_length / 2, -obj_height / 2],  # 右上前
+        [-obj_width / 2, obj_length / 2, -obj_height / 2],  # 左上前
+        [-obj_width / 2, -obj_length / 2, obj_height / 2],  # 左下后
+        [obj_width / 2, -obj_length / 2, obj_height / 2],  # 右下后
+        [obj_width / 2, obj_length / 2, obj_height / 2],  # 右上后
+        [-obj_width / 2, obj_length / 2, obj_height / 2]  # 左上后
     ])
 
     if camera_name == 'desktop':
@@ -369,18 +373,18 @@ def control_loop(
                 tag_obj_result = at_detector.detection_pose(tag, cameraparam, tag_size=tag_size)
                 if show_obj_tag_cube:
                     img_pts, _ = cv2.projectPoints(
-                        tag_3d_corners, tag_obj_result[0][:3, :3], tag_obj_result[0][:3, 3], K, distCoeffs=distCoeffs
+                        virtual_obj_3d_corners, tag_obj_result[0][:3, :3], tag_obj_result[0][:3, 3], K, distCoeffs=distCoeffs
                     )
                     draw_image_points(laptop_frame, img_pts)
-
+        total_reward = 0.0
         trans_between_2tags = np.array([0.0, 0.0, 0.0])
         eulerangles = np.array([0.0, 0.0, 0.0])
         for tag in tags:
-            if tag.tag_id == tag_obj_id or tag.tag_id == 10:
+            if tag.tag_id == tag_obj_id:
                 continue
             result = at_detector.detection_pose(tag, cameraparam, tag_size=tag_size)
             if show_grasp_tag_cube:
-                img_pts, _ = cv2.projectPoints(tag_3d_corners, result[0][:3, :3], result[0][:3, 3], K,
+                img_pts, _ = cv2.projectPoints(virtual_obj_3d_corners, result[0][:3, :3], result[0][:3, 3], K,
                                                distCoeffs=distCoeffs)
                 draw_image_points(laptop_frame, img_pts)
 
@@ -396,34 +400,54 @@ def control_loop(
                 eulerangles = rotationMatrixToEulerAngles(rot_between_2tags) * 180.0 / pi
                 image_text = "euler in tag_obj: %s" % ["%.2f" % item for item in eulerangles]
                 draw_text(laptop_frame, image_text, 150, show_text)
-                #print(np.concatenate((trans_between_2tags, eulerangles)))
+                temp = (rot_between_2tags @ virtual_obj_3d_corners.T).T + trans_between_2tags
+
+                iou = compute_iou(get_convex_hull(temp), get_convex_hull(virtual_obj_3d_corners))
+                image_text = "iou: %.2f" % iou
+                draw_text(laptop_frame, image_text, 200, show_text)
+
+                distance_between_2tags *= 100
+                distance_between_2tags = (9 - distance_between_2tags) + 9 if distance_between_2tags < 9 else distance_between_2tags
+                distance_reward = 0.6 * np.exp(-0.12 * (distance_between_2tags - 9))
+                euler_sum = np.sum(np.abs(eulerangles))
+                euler_reward = 0.2 * (
+                            1 - euler_sum / 45) if distance_between_2tags < 13 and euler_sum < 45 else 0
+                iou_reward = 0.2 * iou
+                total_reward = distance_reward + euler_reward + iou_reward
+                image_text = ("reward: %.2f, dis_reward: %.2f, eul_reward: %.2f, iou_reward: %.2f"
+                                % (total_reward, distance_reward, euler_reward, iou_reward))
+                draw_text(laptop_frame, image_text, 250, show_text)
+
         if policy is not None:
             # pred_action = predict_action(
             #    observation, policy, get_safe_torch_device(policy.config.device), policy.config.use_amp
             # )
             #observation['desired_goal'] = torch.tensor([-4.57481870e-03,-9.22452551e-02, 5.56919394e-02,-6.21978684e+00,
  #-2.94220078e+00,-8.39413667e-01]).view(1, -1)
-            observation['desired_goal'] = torch.tensor(np.concatenate((trans_between_2tags, eulerangles)), dtype=torch.float32).view(1, -1)
-            observation['desired_goal'][0,0] -= 0.1
+            #observation['desired_goal'] = torch.tensor(np.concatenate((trans_between_2tags, eulerangles)), dtype=torch.float32).view(1, -1)
+            #observation['desired_goal'][0,0] -= 0.1
             #print(observation['desired_goal'])
             observation['observation.state'] = observation['observation.state'].view(1, -1)
             for name in observation:
                 observation[name] = observation[name].to(torch.device('cuda:0'))
             with torch.no_grad():
                 prediction = policy(observation)
+                noise = prediction.clone().data.normal_(0, 0.2)
+                noise = noise.clamp(-0.3, 0.3)
+                next_actions = prediction + noise
                 #print(prediction)
             # Action can eventually be clipped using `max_relative_target`,
             # so action actually sent is saved in the dataset.
-            action = robot.send_action(prediction.squeeze().cpu())
+            action = robot.send_action(next_actions.squeeze().cpu())
             # print(pred_action)
             action = {"action": action}
 
         if dataset is not None:
-            observation.pop('desired_goal')
+            #observation.pop('desired_goal')
             for name in observation:
                 observation[name] = observation[name].cpu().squeeze()
             frame = {**observation, **action, "task": single_task,
-                     'achieved_goal': np.array(np.concatenate((trans_between_2tags, eulerangles)), dtype=np.float32)}
+                     'reward': np.array([total_reward], dtype=np.float32)}
 
             dataset.add_frame(frame)
 

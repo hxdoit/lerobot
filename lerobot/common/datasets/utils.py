@@ -394,7 +394,7 @@ def get_features_from_robot(robot: Robot, use_videos: bool = True) -> dict:
             key: {"dtype": "video" if use_videos else "image", **ft}
             for key, ft in robot.camera_features.items()
         }
-    return {**robot.motor_features, **camera_ft, **DEFAULT_FEATURES, 'achieved_goal': {"dtype": "float32", "shape": (6,), "names": None}}
+    return {**robot.motor_features, **camera_ft, **DEFAULT_FEATURES, 'reward': {"dtype": "float32", "shape": (1,), "names": None}}
 
 
 def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFeature]:

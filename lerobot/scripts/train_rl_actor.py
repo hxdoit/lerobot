@@ -123,24 +123,21 @@ class Actor(nn.Module):
     ):
         super(Actor, self).__init__()
 
-        self.net_arch = [400, 300, 300]
-        self.features_dim = 6 + 3 # 6 angles + desired goal(xyz)
+        self.net_arch = [400, 300]
+        self.features_dim = 6 # 6 angles
 
         self.action_dim = 6 # 6 angles
-        actor_net = create_mlp(self.features_dim, self.action_dim, self.net_arch, squash_output=True)
+        actor_net = create_mlp(self.features_dim, self.action_dim, self.net_arch, squash_output=False)
         self.mu = nn.Sequential(*actor_net)
         self.mean = torch.tensor([-27.4765,  86.3493,  92.4536,  67.2350,   5.4615,  -0.2023]).to('cuda:0')
         self.std = torch.tensor([10.0312, 33.6212, 30.0723,  7.6640, 12.1933,  0.2019]).to('cuda:0')
-        self.mean_goal = torch.tensor([-0.1009, -0.0396, 0.0833, -0.1514, 3.7486, 0.6193]).to('cuda:0')
-        self.std_goal = torch.tensor([0.0259, 0.0617, 0.0588, 11.7165, 14.9634, 3.5495]).to('cuda:0')
 
     def forward(self, obs):
         state = obs['observation.state']
-        state = (state - self.mean) / (self.std + 1e-8)
-        desired_goal = (obs['desired_goal'] - self.mean_goal) / (self.std_goal + 1e-8)
-        features = torch.cat((state, desired_goal[:, :3]), dim=1)
-        actions = self.mu(features)
-        return actions * self.std + self.mean
+        #state = (state - self.mean) / (self.std + 1e-8)
+        actions = self.mu(state)
+        #return actions * self.std + self.mean
+        return actions
 
 
 class Td3Policy(torch.nn.Module):
@@ -149,14 +146,7 @@ class Td3Policy(torch.nn.Module):
         device = get_safe_torch_device(cfg.policy.device, log=True)
         lr = 1e-2
         self.actor = Actor()
-        self.actor_target = Actor()
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_target.train(False)
-        for p in (self.actor_target.parameters()):
-            p.requires_grad = False
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
-
-
 
     def save_pretrained(self, pretrained_dir):
         pretrained_dir.mkdir(parents=True, exist_ok=True)
@@ -181,11 +171,11 @@ def update_policy(
 
     # Compute actor loss
     next_actions = policy.actor(cur_batch)
-    pred_loss = F.l1_loss(cur_batch['action'], next_actions)
-    joint_speed = next_actions - cur_batch['action']  # 假设当前状态已知
-    speed_loss = torch.mean(
-        torch.relu(torch.abs(joint_speed) - 5))  # 限制速度
-    loss = 0.6 * pred_loss + 0.4 * speed_loss
+    loss = F.l1_loss(cur_batch['action'], next_actions)
+    #joint_speed = next_actions - cur_batch['action']  # 假设当前状态已知
+    #speed_loss = torch.mean(
+     #   torch.relu(torch.abs(joint_speed) - 5))  # 限制速度
+    #loss = 0.6 * pred_loss + 0.4 * speed_loss
     # Optimize the actor
     policy.actor_optimizer.zero_grad()
     loss.backward()
