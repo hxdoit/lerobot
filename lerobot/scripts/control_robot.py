@@ -318,7 +318,7 @@ def record(
 
     # Load pretrained policy
     #policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
-    policy = torch.load('outputs/train/act_so100_rl6/checkpoints/040000/actor.pth', weights_only=False)
+    policy = torch.load('outputs5/train/act_so100_rl6/checkpoints/040000/actor.pth', weights_only=False)
     policy.to(torch.device('cuda:0'))
 
     if not robot.is_connected:

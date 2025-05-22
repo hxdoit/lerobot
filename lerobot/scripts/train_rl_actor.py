@@ -1,0 +1,339 @@
+#!/usr/bin/env python
+
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+import os
+import threading
+import time
+from collections import deque
+from contextlib import nullcontext
+from itertools import zip_longest
+from multiprocessing import Process
+from os import mkdir
+from pprint import pformat
+import random
+from typing import Any, Iterable, List, Type
+
+import numpy as np
+import torch as th
+import safetensors
+import torch
+from termcolor import colored
+from torch.amp import GradScaler
+import torch.optim as optim
+from torch.optim import Optimizer
+from torch import nn
+import torch.nn.functional as F
+from lerobot.common.datasets.factory import make_dataset
+from lerobot.common.datasets.sampler import EpisodeAwareSampler
+from lerobot.common.datasets.utils import cycle
+from lerobot.common.envs.factory import make_env
+from lerobot.common.optim.factory import make_optimizer_and_scheduler
+from lerobot.common.policies.act.modeling_act import ACTPolicy
+from lerobot.common.policies.factory import make_policy
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.common.policies.utils import get_device_from_parameters
+from lerobot.common.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.common.utils.random_utils import set_seed
+from lerobot.common.utils.train_utils import (
+    get_step_checkpoint_dir,
+    get_step_identifier,
+    load_training_state,
+    save_td3_checkpoint,
+    update_last_checkpoint,
+)
+from lerobot.common.utils.utils import (
+    format_big_number,
+    get_safe_torch_device,
+    has_method,
+    init_logging,
+)
+from lerobot.common.utils.wandb_utils import WandBLogger
+from lerobot.configs import parser
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.scripts.eval import eval_policy
+import copy
+def zip_strict(*iterables: Iterable) -> Iterable:
+    r"""
+    ``zip()`` function but enforces that iterables are of equal length.
+    Raises ``ValueError`` if iterables not of equal length.
+    Code inspired by Stackoverflow answer for question #32954486.
+
+    :param \*iterables: iterables to ``zip()``
+    """
+    # As in Stackoverflow #32954486, use
+    # new object for "empty" in case we have
+    # Nones in iterable.
+    sentinel = object()
+    for combo in zip_longest(*iterables, fillvalue=sentinel):
+        if sentinel in combo:
+            raise ValueError("Iterables have different lengths")
+        yield combo
+
+def polyak_update(
+    params: Iterable[torch.nn.Parameter],
+    target_params: Iterable[torch.nn.Parameter],
+    tau: float,
+) -> None:
+    with torch.no_grad():
+        # zip does not raise an exception if length of parameters does not match.
+        for param, target_param in zip_strict(params, target_params):
+            target_param.data.mul_(1 - tau)
+            torch.add(target_param.data, param.data, alpha=tau, out=target_param.data)
+
+def create_mlp(
+    input_dim: int,
+    output_dim: int,
+    net_arch: List[int],
+    activation_fn: Type[nn.Module] = nn.ReLU,
+    squash_output: bool = False,
+):
+
+    if len(net_arch) > 0:
+        modules = [nn.Linear(input_dim, net_arch[0]), activation_fn()]
+    else:
+        modules = []
+
+    for idx in range(len(net_arch) - 1):
+        modules.append(nn.Linear(net_arch[idx], net_arch[idx + 1]))
+        modules.append(activation_fn())
+
+    if output_dim > 0:
+        last_layer_dim = net_arch[-1] if len(net_arch) > 0 else input_dim
+        modules.append(nn.Linear(last_layer_dim, output_dim))
+    if squash_output:
+        modules.append(nn.Tanh())
+    return modules
+
+class Actor(nn.Module):
+    def __init__(
+        self,
+    ):
+        super(Actor, self).__init__()
+
+        self.net_arch = [400, 300, 300]
+        self.features_dim = 6 + 3 # 6 angles + desired goal(xyz)
+
+        self.action_dim = 6 # 6 angles
+        actor_net = create_mlp(self.features_dim, self.action_dim, self.net_arch, squash_output=True)
+        self.mu = nn.Sequential(*actor_net)
+        self.mean = torch.tensor([-27.4765,  86.3493,  92.4536,  67.2350,   5.4615,  -0.2023]).to('cuda:0')
+        self.std = torch.tensor([10.0312, 33.6212, 30.0723,  7.6640, 12.1933,  0.2019]).to('cuda:0')
+        self.mean_goal = torch.tensor([-0.1009, -0.0396, 0.0833, -0.1514, 3.7486, 0.6193]).to('cuda:0')
+        self.std_goal = torch.tensor([0.0259, 0.0617, 0.0588, 11.7165, 14.9634, 3.5495]).to('cuda:0')
+
+    def forward(self, obs):
+        state = obs['observation.state']
+        state = (state - self.mean) / (self.std + 1e-8)
+        desired_goal = (obs['desired_goal'] - self.mean_goal) / (self.std_goal + 1e-8)
+        features = torch.cat((state, desired_goal[:, :3]), dim=1)
+        actions = self.mu(features)
+        return actions * self.std + self.mean
+
+
+class Td3Policy(torch.nn.Module):
+    def __init__(self, cfg, dataset, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        device = get_safe_torch_device(cfg.policy.device, log=True)
+        lr = 1e-2
+        self.actor = Actor()
+        self.actor_target = Actor()
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_target.train(False)
+        for p in (self.actor_target.parameters()):
+            p.requires_grad = False
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
+
+
+
+    def save_pretrained(self, pretrained_dir):
+        pretrained_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.actor, pretrained_dir / 'actor.pth')
+
+
+def update_policy(
+    cur_step,
+    train_metrics: MetricsTracker,
+    policy,
+    batch_tuple: Any,
+    grad_clip_norm: float,
+    use_amp: bool = False,
+    lock=None,
+) -> tuple[MetricsTracker, dict]:
+    cur_batch = batch_tuple[0]
+    next_batch = batch_tuple[1]
+    gamma = 0.99
+    tau = 0.005
+    start_time = time.perf_counter()
+
+
+    # Compute actor loss
+    next_actions = policy.actor(cur_batch)
+    pred_loss = F.l1_loss(cur_batch['action'], next_actions)
+    joint_speed = next_actions - cur_batch['action']  # 假设当前状态已知
+    speed_loss = torch.mean(
+        torch.relu(torch.abs(joint_speed) - 5))  # 限制速度
+    loss = 0.6 * pred_loss + 0.4 * speed_loss
+    # Optimize the actor
+    policy.actor_optimizer.zero_grad()
+    loss.backward()
+    policy.actor_optimizer.step()
+
+    train_metrics.actor_loss = loss.cpu().item()
+
+
+    train_metrics.update_s = time.perf_counter() - start_time
+    return train_metrics
+
+
+from multiprocessing import Queue
+processnum = 16
+dq = []
+for i in range(processnum):
+    dq.append(Queue(maxsize=50))
+def process_task(dataset, que, pdx):
+    np.random.seed(int(time.time() * 1e6 % 1e6))
+    count = 0
+    while True:
+        while que.full():
+            time.sleep(0.05)
+        batch_tuple = dataset.sample(100)
+        que.put(batch_tuple)
+        count += 1
+def main_get_one_data():
+    global dq
+    global processnum
+    randQ = dq[random.randint(0, processnum - 1)]
+    while randQ.empty():
+        time.sleep(0.05)
+    return randQ.get()
+
+@parser.wrap()
+def train(cfg: TrainPipelineConfig):
+    cfg.validate()
+    logging.info(pformat(cfg.to_dict()))
+
+    if cfg.wandb.enable and cfg.wandb.project:
+        wandb_logger = WandBLogger(cfg)
+    else:
+        wandb_logger = None
+        logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
+
+    #if cfg.seed is not None:
+    #    set_seed(cfg.seed)
+
+    # Check device is available
+    device = get_safe_torch_device(cfg.policy.device, log=True)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    logging.info("Creating dataset")
+    dataset = make_dataset(cfg)
+
+    # Create environment used for evaluating checkpoints during training on simulation data.
+    # On real-world data, no need to create an environment as evaluations are done outside train.py,
+    # using the eval.py instead, with gym_dora environment and dora-rs.
+    eval_env = None
+    if cfg.eval_freq > 0 and cfg.env is not None:
+        logging.info("Creating env")
+        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+
+    logging.info("Creating policy")
+
+    td3policy = Td3Policy(cfg, dataset)
+    td3policy.to(device)
+
+    step = 0  # number of policy updates (forward + backward + optim)
+
+    num_learnable_params = sum(p.numel() for p in td3policy.parameters() if p.requires_grad)
+    num_total_params = sum(p.numel() for p in td3policy.parameters())
+
+    logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+    if cfg.env is not None:
+        logging.info(f"{cfg.env.task=}")
+    logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
+    logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
+    logging.info(f"{dataset.num_episodes=}")
+    logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
+    logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+
+    global dq
+    global processnum
+    processes = []
+    for pidx in range(processnum):
+        p = Process(target=process_task, args=(dataset, dq[pidx], pidx))
+        p.start()
+        processes.append(p)
+
+    train_metrics = {
+        "actor_loss": AverageMeter("actor_loss", ":.4f"),
+        "critic_loss": AverageMeter("critic_loss", ":.4f"),
+        "critic_q0": AverageMeter("critic_q0", ":.4f"),
+        "critic_q1": AverageMeter("critic_q1", ":.4f"),
+        "update_s": AverageMeter("updt_s", ":.3f"),
+        "dataloading_s": AverageMeter("data_s", ":.3f"),
+    }
+
+    train_tracker = MetricsTracker(
+        cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
+    )
+
+
+    logging.info("Start offline training on a fixed dataset")
+    for cur_step in range(step, cfg.steps):
+        start_time = time.perf_counter()
+        batch_tuple = main_get_one_data()
+
+        train_tracker.dataloading_s = time.perf_counter() - start_time
+        for batch in batch_tuple:
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device, non_blocking=True)
+
+        train_tracker = update_policy(
+            cur_step,
+            train_tracker,
+            td3policy,
+            batch_tuple,
+            cfg.optimizer.grad_clip_norm,
+            use_amp=cfg.policy.use_amp,
+        )
+
+        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+        # increment `step` here.
+        step += 1
+        train_tracker.step()
+        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+
+        if is_log_step:
+            logging.info(train_tracker)
+            train_tracker.reset_averages()
+
+        if cfg.save_checkpoint and is_saving_step:
+            logging.info(f"Checkpoint policy after step {step}")
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            td3policy.save_pretrained(checkpoint_dir)
+
+
+    logging.info("End of training")
+    for data_process in processes:
+        data_process.join()
+
+
+if __name__ == "__main__":
+    init_logging()
+    train()

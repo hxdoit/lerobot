@@ -512,7 +512,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset_bak.append(self.hf_dataset[ds_idx])
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         self.n_episodes_stored = self.episode_data_index['from'].shape[0]
-        self.her_ratio = 0.8
+        self.her_ratio = 1
         self.episode_lengths = self.episode_data_index['to'] - self.episode_data_index['from']
 
         # Check timestamps

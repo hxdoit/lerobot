@@ -401,13 +401,17 @@ def control_loop(
             # pred_action = predict_action(
             #    observation, policy, get_safe_torch_device(policy.config.device), policy.config.use_amp
             # )
-            observation['desired_goal'] = torch.tensor([-4.57481870e-03,-9.22452551e-02, 5.56919394e-02,-6.21978684e+00,
- -2.94220078e+00,-8.39413667e-01]).view(1, -1)
+            #observation['desired_goal'] = torch.tensor([-4.57481870e-03,-9.22452551e-02, 5.56919394e-02,-6.21978684e+00,
+ #-2.94220078e+00,-8.39413667e-01]).view(1, -1)
+            observation['desired_goal'] = torch.tensor(np.concatenate((trans_between_2tags, eulerangles)), dtype=torch.float32).view(1, -1)
+            observation['desired_goal'][0,0] -= 0.1
+            #print(observation['desired_goal'])
             observation['observation.state'] = observation['observation.state'].view(1, -1)
             for name in observation:
                 observation[name] = observation[name].to(torch.device('cuda:0'))
             with torch.no_grad():
                 prediction = policy(observation)
+                #print(prediction)
             # Action can eventually be clipped using `max_relative_target`,
             # so action actually sent is saved in the dataset.
             action = robot.send_action(prediction.squeeze().cpu())
@@ -415,8 +419,12 @@ def control_loop(
             action = {"action": action}
 
         if dataset is not None:
+            observation.pop('desired_goal')
+            for name in observation:
+                observation[name] = observation[name].cpu().squeeze()
             frame = {**observation, **action, "task": single_task,
                      'achieved_goal': np.array(np.concatenate((trans_between_2tags, eulerangles)), dtype=np.float32)}
+
             dataset.add_frame(frame)
 
         if display_cameras and not is_headless():
