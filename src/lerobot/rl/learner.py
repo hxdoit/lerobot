@@ -70,7 +70,7 @@ from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.robots import so100_follower  # noqa: F401
-from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
+from lerobot.teleoperators import gamepad, so101_leader, keyboard  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2_grpc
 from lerobot.transport.utils import (
@@ -100,7 +100,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
+from src.lerobot.rl.learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 
 
 @parser.wrap()
@@ -414,7 +414,7 @@ def add_actor_information_and_train(
 
             # Create a batch dictionary with all required elements for the forward method
             forward_batch = {
-                ACTION: actions,
+                ACTION: actions[:, :3], # only keep x&y&z
                 "reward": rewards,
                 "state": observations,
                 "next_state": next_observations,
@@ -473,7 +473,7 @@ def add_actor_information_and_train(
 
         # Create a batch dictionary with all required elements for the forward method
         forward_batch = {
-            ACTION: actions,
+            ACTION: actions[:, :3], # only keep x&y&z
             "reward": rewards,
             "state": observations,
             "next_state": next_observations,

@@ -16,7 +16,8 @@
 
 import platform
 from contextlib import suppress
-from queue import Empty
+import importlib
+Empty = importlib.import_module('queue').Empty
 from typing import Any
 
 from torch.multiprocessing import Queue

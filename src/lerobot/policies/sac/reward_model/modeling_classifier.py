@@ -269,14 +269,18 @@ class Classifier(PreTrainedPolicy):
     def predict_reward(self, batch, threshold=0.5):
         """Eval method. Returns predicted reward with the decision threshold as argument."""
         # Check for both OBS_IMAGE and OBS_IMAGES prefixes
-        batch = self.normalize_inputs(batch)
-        batch = self.normalize_targets(batch)
+        #batch = self.normalize_inputs(batch)
+        #batch = self.normalize_targets(batch)
 
         # Extract images from batch dict
-        images = [batch[key] for key in self.config.input_features if key.startswith(OBS_IMAGE)]
+        images = [batch[key].to('cuda:0') for key in self.config.input_features if key.startswith(OBS_IMAGE)]
+        mean = torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1).to('cuda:0')
+        std = torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1).to('cuda:0')
+        images = [(pic - mean) / std for pic in images]
 
         if self.config.num_classes == 2:
             probs = self.predict(images).probabilities
+            print("probs:%s" % probs)
             logging.debug(f"Predicted reward images: {probs}")
             return (probs > threshold).float()
         else:

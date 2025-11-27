@@ -532,6 +532,9 @@ class InverseKinematicsRLStep(ProcessorStep):
     motor_names: list[str]
     q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
+    # Safety check parameters
+    enable_joint_velocity_check: bool = True
+    max_joint_step_rad: float = 2  # Max norm of joint angle change per step (in radians)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = dict(transition)
@@ -577,6 +580,27 @@ class InverseKinematicsRLStep(ProcessorStep):
 
         # Compute inverse kinematics
         q_target = self.kinematics.inverse_kinematics(self.q_curr, t_des)
+
+        # --- JOINT-SPACE SAFETY CHECKS ---
+
+        # Joint Velocity / Jump Check
+        if self.enable_joint_velocity_check:
+            # Compare target joint angles (in deg) with current joint angles (in deg)
+            joint_delta_deg = q_target - q_raw
+            joint_delta_rad = np.deg2rad(joint_delta_deg)
+            joint_delta_norm_rad = float(np.linalg.norm(joint_delta_rad))
+
+            if joint_delta_norm_rad > self.max_joint_step_rad:
+                print(
+                    f"Joint jump limited from {joint_delta_norm_rad:.3f}rad to {self.max_joint_step_rad}rad"
+                )
+                # Scale down the delta to the maximum allowed step
+                scaled_joint_delta_rad = joint_delta_rad * (self.max_joint_step_rad / joint_delta_norm_rad)
+                # Apply the scaled-down delta to the current raw position
+                q_target = q_raw + np.rad2deg(scaled_joint_delta_rad)
+
+        # --- END OF SAFETY CHECKS ---
+
         self.q_curr = q_target
 
         # TODO: This is sentitive to order of motor_names = q_target mapping

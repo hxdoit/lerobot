@@ -28,7 +28,7 @@ class Transition(TypedDict):
     next_state: dict[str, torch.Tensor]
     done: bool
     truncated: bool
-    complementary_info: dict[str, torch.Tensor | float | int] | None = None
+    complementary_info: dict[str, torch.Tensor | float | int | bool] | None = None
 
 
 def move_transition_to_device(transition: Transition, device: str = "cpu") -> Transition:

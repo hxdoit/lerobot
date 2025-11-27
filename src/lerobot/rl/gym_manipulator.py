@@ -535,6 +535,8 @@ def step_env_and_process_transition(
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
     obs, reward, terminated, truncated, info = env.step(processed_action)
+    # info always set IS_INTERVENTION=False
+    info.pop(TeleopEvents.IS_INTERVENTION, None)
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]

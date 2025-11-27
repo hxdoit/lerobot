@@ -77,7 +77,8 @@ def find_joint_and_ee_bounds(cfg: FindJointLimitsConfig):
         # Note to be compatible with the rest of the codebase,
         # we are using the new calibration method for so101 and so100
         robot_type = "so_new_calibration"
-    kinematics = RobotKinematics(cfg.robot.urdf_path, cfg.robot.target_frame_name)
+    #kinematics = RobotKinematics(cfg.robot.urdf_path, cfg.robot.target_frame_name)
+    kinematics = RobotKinematics('/home/ubuntu/Downloads/embodient/SO-ARM100/Simulation/SO101/so101_new_calib.urdf', 'gripper_frame_link')
 
     # Initialize min/max values
     observation = robot.get_observation()

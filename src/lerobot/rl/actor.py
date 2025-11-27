@@ -90,7 +90,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-from .gym_manipulator import (
+from src.lerobot.rl.gym_manipulator import (
     create_transition,
     make_processors,
     make_robot_env,
@@ -290,6 +290,10 @@ def act_with_policy(
         with policy_timer:
             # Extract observation from transition for policy
             action = policy.select_action(batch=observation)
+            #action.zero_()
+            # add action for z axis and gripper
+            added_action = torch.ones((action.shape[0], 1), device='cuda:0')
+            action = torch.cat((action, added_action), dim=1)
         policy_fps = policy_timer.fps_last
 
         log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
@@ -313,6 +317,7 @@ def act_with_policy(
         # Teleop action is the action that was executed in the environment
         # It is either the action from the teleop device or the action from the policy
         executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
+        print("executed_action:%s" % executed_action)
 
         reward = new_transition[TransitionKey.REWARD]
         done = new_transition.get(TransitionKey.DONE, False)
@@ -331,6 +336,7 @@ def act_with_policy(
             "discrete_penalty": torch.tensor(
                 [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
             ),
+            TeleopEvents.IS_INTERVENTION: intervention_info.get(TeleopEvents.IS_INTERVENTION, False),
         }
         # Create transition for learner (convert to old format)
         list_transition_to_send_to_learner.append(
