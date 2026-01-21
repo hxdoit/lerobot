@@ -1,21 +1,21 @@
 {
-    "output_dir": null,
+    "output_dir": "/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default",
     "job_name": "default",
     "resume": false,
     "seed": 1000,
     "num_workers": 4,
     "batch_size": 256,
-    "steps": 100000,
+    "steps": 300000,
     "log_freq": 500,
     "save_checkpoint": true,
-    "save_freq": 2000000,
+    "save_freq": 20000,
     "wandb": {
         "enable": true,
         "project": "so100_real",
         "disable_artifact": true
     },
     "dataset": {
-        "repo_id": "hxdoso/push_cube82",
+        "repo_id": "hxdoso/push_cube87",
         "use_imagenet_stats": false
     },
     "policy": {
@@ -68,18 +68,18 @@
             },
             "observation.state": {
                 "min": [
-                    -12.747252464294434,
-                    5.714285850524902,
-                    -63.07692337036133,
-                    70.19779968261719,
-                    -25.714284896850586,
-                    1.8531228303909302,
-                    -21.098901748657227,
-                    -29.890098571777344,
-                    -59.780235290527344,
-                    -19.340667724609375,
-                    -18.4615421295166,
-                    -2.0590245723724365,
+                    -46.241756439208984,
+                    -15.560439109802246,
+                    -46.63736343383789,
+                    66.989013671875,
+                    -36.17582321166992,
+                    1.2173912525177002,
+                    -16.70328140258789,
+                    -30.76923370361328,
+                    -47.4725341796875,
+                    -23.73626708984375,
+                    -16.703296661376953,
+                    -6.0869574546813965,
                     0.0,
                     0.0,
                     0.0,
@@ -88,24 +88,24 @@
                     0.0
                 ],
                 "max": [
-                    35.868133544921875,
-                    61.71428680419922,
-                    25.9780216217041,
-                    95.42857360839844,
-                    21.846153259277344,
-                    2.196293830871582,
-                    18.46154022216797,
-                    36.043968200683594,
-                    50.10988998413086,
-                    28.131866455078125,
-                    14.065942764282227,
-                    2.745368480682373,
-                    3.0,
-                    24.0,
-                    6.0,
+                    0.35164836049079895,
+                    52.483516693115234,
+                    49.80219650268555,
+                    94.76923370361328,
+                    8.747252464294434,
+                    2.7826087474823,
+                    24.615392684936523,
+                    29.890098571777344,
+                    58.0219841003418,
+                    21.09893798828125,
+                    22.857141494750977,
+                    4.347827434539795,
                     2.0,
-                    4.0,
-                    1.0
+                    23.0,
+                    11.0,
+                    3.0,
+                    2.0,
+                    2.0
                 ]
             },
             "action": {
@@ -132,7 +132,7 @@
         "offline_buffer_capacity": 10000,
         "online_step_before_learning": 10,
         "policy_update_freq": 1,
-        "discount": 0.97,
+        "discount": 0.995,
         "async_prefetch": false,
         "temperature_init": 0.01,
         "num_critics": 2,
@@ -183,8 +183,9 @@
         "type": "gym_manipulator",
         "robot": {
             "type": "so100_follower",
-            "port": "/dev/ttyACM0",
+            "port": "/dev/ttyACM1",
             "id": "my_awesome_follower_arm",
+            "use_degrees": true,
             "cameras": {
                 "top": {
                     "type": "opencv",
@@ -208,7 +209,7 @@
             },
             "image_preprocessing": {
                 "crop_params_dict": {
-                  "observation.images.top": [131, 20, 240, 493]
+                  "observation.images.top": [120, 0, 307, 594]
                 },
                 "resize_size": [128, 128]
             },
@@ -217,9 +218,9 @@
                 "gripper_penalty": 0
             },
             "reset": {
-                "fixed_reset_joint_positions": [ 35.7802,  27.3407, -12.8791,  84.6154,  21.9341,   2.1277],
+                "fixed_reset_joint_positions": [ 0.08791,  -4.39560, 38.19780,  69.97802,  9.09890,   2.17391],
                 "reset_time_s": 5,
-                "control_time_s": 20.0,
+                "control_time_s": 30.0,
                 "terminate_on_success": true
             },
             "inverse_kinematics": {

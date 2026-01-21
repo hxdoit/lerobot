@@ -204,7 +204,7 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 delta_z = -int(val)
             elif key == 'f':
                 delta_z = int(val)
-            else:
+            elif val:
                 # If the key is pressed, add it to the misc_keys_queue
                 # this will record key presses that are not part of the delta_x, delta_y, delta_z
                 # this is useful for retrieving other events like interventions for RL, episode success, etc.

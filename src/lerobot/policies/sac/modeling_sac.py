@@ -169,7 +169,7 @@ class SACPolicy(
             done: Tensor = batch["done"]
             next_observation_features: Tensor = batch.get("next_observation_feature")
 
-            loss_critic = self.compute_loss_critic(
+            loss_critic, q_predict = self.compute_loss_critic(
                 observations=observations,
                 actions=actions,
                 rewards=rewards,
@@ -179,7 +179,7 @@ class SACPolicy(
                 next_observation_features=next_observation_features,
             )
 
-            return {"loss_critic": loss_critic}
+            return {"loss_critic": loss_critic, "q_predict": q_predict}
 
         if model == "discrete_critic" and self.config.num_discrete_actions is not None:
             # Extract critic-specific components
@@ -251,7 +251,7 @@ class SACPolicy(
         done,
         observation_features: Tensor | None = None,
         next_observation_features: Tensor | None = None,
-    ) -> Tensor:
+    ):
         with torch.no_grad():
             next_action_preds, next_log_probs, _ = self.actor(next_observations, next_observation_features)
 
@@ -301,7 +301,7 @@ class SACPolicy(
                 reduction="none",
             ).mean(dim=1)
         ).sum()
-        return critics_loss
+        return critics_loss, q_preds.min(dim=0, keepdim=True)[0].mean().item()
 
     def compute_loss_discrete_critic(
         self,

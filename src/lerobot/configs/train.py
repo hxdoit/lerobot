@@ -78,7 +78,8 @@ class TrainPipelineConfig(HubMixin):
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
             # The entire train config is already loaded, we just need to get the checkpoint dir
-            config_path = parser.parse_arg("config_path")
+            #config_path = parser.parse_arg("config_path")
+            config_path = f"{self.output_dir}/checkpoints/last/pretrained_model/train_config.json"
             if not config_path:
                 raise ValueError(
                     f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"

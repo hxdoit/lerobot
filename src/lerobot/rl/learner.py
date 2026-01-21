@@ -496,6 +496,7 @@ def add_actor_information_and_train(
         training_infos = {
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
+            "q_predict": critic_output["q_predict"],
         }
 
         # Discrete critic optimization (if available)
@@ -867,7 +868,7 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     # Load config using Draccus
     checkpoint_cfg_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, "train_config.json")
     checkpoint_cfg = TrainRLServerPipelineConfig.from_pretrained(checkpoint_cfg_path)
-
+    checkpoint_cfg.policy.pretrained_path = cfg.policy.pretrained_path
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
     return checkpoint_cfg
@@ -970,6 +971,7 @@ def initialize_replay_buffer(
         lerobot_dataset=dataset,
         capacity=cfg.policy.online_buffer_capacity,
         device=device,
+        storage_device=storage_device,
         state_keys=cfg.policy.input_features.keys(),
         optimize_memory=True,
     )
