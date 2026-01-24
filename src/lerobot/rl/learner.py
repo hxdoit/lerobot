@@ -909,7 +909,7 @@ def initialize_replay_buffer(
     """
 
     logging.info("Resume training load the online dataset")
-    dataset_path = cfg.dataset.root
+    dataset_path = os.path.join("/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default", "dataset")
 
     # NOTE: In RL is possible to not have a dataset.
     repo_id = None
