@@ -477,7 +477,7 @@ def add_actor_information_and_train(
         training_infos = {
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
-            "q_predict": critic_output["q_predict"].mean().item(),
+            "q_predict": critic_output["q_predict"],
         }
 
         # Discrete critic optimization (if available)
@@ -909,7 +909,7 @@ def initialize_replay_buffer(
     """
 
     logging.info("Resume training load the online dataset")
-    dataset_path = os.path.join("/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default", "dataset")
+    dataset_path = cfg.dataset.root
 
     # NOTE: In RL is possible to not have a dataset.
     repo_id = None
