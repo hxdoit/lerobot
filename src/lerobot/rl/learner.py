@@ -265,7 +265,7 @@ def add_actor_information_and_train(
     - Logs received interaction messages.
     - Ensures training begins only when the replay buffer has a sufficient number of transitions.
     - Samples batches from the replay buffer and performs multiple critic updates.
-    - Periodically updates the actor, critic, and temperature optimizers.
+    - Periodically updates the actor and critic optimizers.
     - Logs training statistics, including loss values and optimization frequency.
 
     NOTE: This function doesn't have a single responsibility, it should be split into multiple functions
@@ -330,13 +330,6 @@ def add_actor_information_and_train(
     batch_size = cfg.batch_size
     offline_replay_buffer = None
 
-    if cfg.dataset is not None:
-        offline_replay_buffer = initialize_offline_replay_buffer(
-            cfg=cfg,
-            device=device,
-            storage_device=storage_device,
-        )
-        batch_size: int = batch_size // 2  # We will sample from both replay buffer
 
     logging.info("Starting learner thread")
     interaction_message = None
@@ -395,12 +388,6 @@ def add_actor_information_and_train(
             # Sample from the iterators
             batch = next(online_iterator)
 
-            if dataset_repo_id is not None:
-                batch_offline = next(offline_iterator)
-                batch = concatenate_batch_transitions(
-                    left_batch_transitions=batch, right_batch_transition=batch_offline
-                )
-
             actions = batch[ACTION]
             rewards = batch["reward"]
             observations = batch["state"]
@@ -453,12 +440,6 @@ def add_actor_information_and_train(
         # Sample for the last update in the UTD ratio
         batch = next(online_iterator)
 
-        if dataset_repo_id is not None:
-            batch_offline = next(offline_iterator)
-            batch = concatenate_batch_transitions(
-                left_batch_transitions=batch, right_batch_transition=batch_offline
-            )
-
         actions = batch[ACTION]
         rewards = batch["reward"]
         observations = batch["state"]
@@ -496,7 +477,7 @@ def add_actor_information_and_train(
         training_infos = {
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
-            "q_predict": critic_output["q_predict"],
+            "q_predict": critic_output["q_predict"].mean().item(),
         }
 
         # Discrete critic optimization (if available)
@@ -514,7 +495,7 @@ def add_actor_information_and_train(
             training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
             training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
 
-        # Actor and temperature optimization (at specified frequency)
+        # Actor optimization (at specified frequency)
         if optimization_step % policy_update_freq == 0:
             for _ in range(policy_update_freq):
                 # Actor optimization
@@ -531,23 +512,6 @@ def add_actor_information_and_train(
                 training_infos["loss_actor"] = loss_actor.item()
                 training_infos["actor_grad_norm"] = actor_grad_norm
 
-                # Temperature optimization
-                temperature_output = policy.forward(forward_batch, model="temperature")
-                loss_temperature = temperature_output["loss_temperature"]
-                optimizers["temperature"].zero_grad()
-                loss_temperature.backward()
-                temp_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
-                ).item()
-                optimizers["temperature"].step()
-
-                # Add temperature info to training info
-                training_infos["loss_temperature"] = loss_temperature.item()
-                training_infos["temperature_grad_norm"] = temp_grad_norm
-                training_infos["temperature"] = policy.temperature
-
-                # Update temperature
-                policy.update_temperature()
 
         # Push policy to actors if needed
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
@@ -764,27 +728,25 @@ def save_training_checkpoint(
 
 def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.Module):
     """
-    Creates and returns optimizers for the actor, critic, and temperature components of a reinforcement learning policy.
+    Creates and returns optimizers for the actor and critic components of a reinforcement learning policy.
 
     This function sets up Adam optimizers for:
     - The **actor network**, ensuring that only relevant parameters are optimized.
     - The **critic ensemble**, which evaluates the value function.
-    - The **temperature parameter**, which controls the entropy in soft actor-critic (SAC)-like methods.
 
     It also initializes a learning rate scheduler, though currently, it is set to `None`.
 
     NOTE:
     - If the encoder is shared, its parameters are excluded from the actor's optimization process.
-    - The policy's log temperature (`log_alpha`) is wrapped in a list to ensure proper optimization as a standalone tensor.
 
     Args:
         cfg: Configuration object containing hyperparameters.
-        policy (nn.Module): The policy model containing the actor, critic, and temperature components.
+        policy (nn.Module): The policy model containing the actor and critic components.
 
     Returns:
         Tuple[Dict[str, torch.optim.Optimizer], Optional[torch.optim.lr_scheduler._LRScheduler]]:
         A tuple containing:
-        - `optimizers`: A dictionary mapping component names ("actor", "critic", "temperature") to their respective Adam optimizers.
+        - `optimizers`: A dictionary mapping component names ("actor", "critic") to their respective Adam optimizers.
         - `lr_scheduler`: Currently set to `None` but can be extended to support learning rate scheduling.
 
     """
@@ -802,12 +764,10 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
         optimizer_discrete_critic = torch.optim.Adam(
             params=policy.discrete_critic.parameters(), lr=cfg.policy.critic_lr
         )
-    optimizer_temperature = torch.optim.Adam(params=[policy.log_alpha], lr=cfg.policy.critic_lr)
     lr_scheduler = None
     optimizers = {
         "actor": optimizer_actor,
         "critic": optimizer_critic,
-        "temperature": optimizer_temperature,
     }
     if cfg.policy.num_discrete_actions is not None:
         optimizers["discrete_critic"] = optimizer_discrete_critic
@@ -947,17 +907,9 @@ def initialize_replay_buffer(
     Returns:
         ReplayBuffer: Initialized replay buffer
     """
-    if not cfg.resume:
-        return ReplayBuffer(
-            capacity=cfg.policy.online_buffer_capacity,
-            device=device,
-            state_keys=cfg.policy.input_features.keys(),
-            storage_device=storage_device,
-            optimize_memory=True,
-        )
 
     logging.info("Resume training load the online dataset")
-    dataset_path = os.path.join(cfg.output_dir, "dataset")
+    dataset_path = os.path.join("/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default", "dataset")
 
     # NOTE: In RL is possible to not have a dataset.
     repo_id = None

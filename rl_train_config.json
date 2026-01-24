@@ -1,7 +1,7 @@
 {
-    "output_dir": "/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default",
+    "output_dir": "/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-24/21-36-11_default",
     "job_name": "default",
-    "resume": false,
+    "resume": true,
     "seed": 1000,
     "num_workers": 4,
     "batch_size": 256,
@@ -11,7 +11,7 @@
     "save_freq": 20000,
     "wandb": {
         "enable": true,
-        "project": "so100_real",
+        "project": "td3_bc1",
         "disable_artifact": true
     },
     "dataset": {

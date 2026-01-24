@@ -55,7 +55,6 @@ class SACPolicy(
         self._init_encoders()
         self._init_critics(continuous_action_dim)
         self._init_actor(continuous_action_dim)
-        self._init_temperature()
 
     def get_optim_params(self) -> dict:
         optim_params = {
@@ -65,7 +64,6 @@ class SACPolicy(
                 if not n.startswith("encoder") or not self.shared_encoder
             ],
             "critic": self.critic_ensemble.parameters(),
-            "temperature": self.log_alpha,
         }
         if self.config.num_discrete_actions is not None:
             optim_params["discrete_critic"] = self.discrete_critic.parameters()
@@ -88,7 +86,7 @@ class SACPolicy(
         if self.shared_encoder and self.actor.encoder.has_images:
             observations_features = self.actor.encoder.get_cached_image_features(batch)
 
-        actions, _, _ = self.actor(batch, observations_features)
+        actions = self.actor(batch, observations_features)
 
         if self.config.num_discrete_actions is not None:
             discrete_action_value = self.discrete_critic(batch, observations_features)
@@ -203,14 +201,7 @@ class SACPolicy(
             return {
                 "loss_actor": self.compute_loss_actor(
                     observations=observations,
-                    observation_features=observation_features,
-                )
-            }
-
-        if model == "temperature":
-            return {
-                "loss_temperature": self.compute_loss_temperature(
-                    observations=observations,
+                    actions = batch[ACTION],
                     observation_features=observation_features,
                 )
             }
@@ -228,6 +219,16 @@ class SACPolicy(
                 param.data * self.config.critic_target_update_weight
                 + target_param.data * (1.0 - self.config.critic_target_update_weight)
             )
+
+        for target_param, param in zip(
+            self.actor_target.parameters(),
+            self.actor.parameters(),
+            strict=True,
+        ):
+            target_param.data.copy_(
+                param.data * self.config.critic_target_update_weight
+                + target_param.data * (1.0 - self.config.critic_target_update_weight)
+            )
         if self.config.num_discrete_actions is not None:
             for target_param, param in zip(
                 self.discrete_critic_target.parameters(),
@@ -238,9 +239,6 @@ class SACPolicy(
                     param.data * self.config.critic_target_update_weight
                     + target_param.data * (1.0 - self.config.critic_target_update_weight)
                 )
-
-    def update_temperature(self):
-        self.temperature = self.log_alpha.exp().item()
 
     def compute_loss_critic(
         self,
@@ -253,12 +251,23 @@ class SACPolicy(
         next_observation_features: Tensor | None = None,
     ):
         with torch.no_grad():
-            next_action_preds, next_log_probs, _ = self.actor(next_observations, next_observation_features)
+            next_action_preds = self.actor_target(next_observations, next_observation_features)
+
+            policy_noise = 0.2
+            noise_clip = 0.5
+            max_action = 1.0
+            noise = (
+                    torch.randn_like(next_action_preds) * policy_noise
+            ).clamp(-noise_clip, noise_clip)
+
+            next_action = (
+                    next_action_preds + noise
+            ).clamp(-max_action, max_action)
 
             # 2- compute q targets
             q_targets = self.critic_forward(
                 observations=next_observations,
-                actions=next_action_preds,
+                actions=next_action,
                 use_target=True,
                 observation_features=next_observation_features,
             )
@@ -272,8 +281,7 @@ class SACPolicy(
 
             # critics subsample size
             min_q, _ = q_targets.min(dim=0)  # Get values from min operation
-            if self.config.use_backup_entropy:
-                min_q = min_q - (self.temperature * next_log_probs)
+
 
             td_target = rewards + (1 - done) * self.config.discount * min_q
 
@@ -362,20 +370,13 @@ class SACPolicy(
         discrete_critic_loss = F.mse_loss(input=predicted_discrete_q, target=target_discrete_q)
         return discrete_critic_loss
 
-    def compute_loss_temperature(self, observations, observation_features: Tensor | None = None) -> Tensor:
-        """Compute the temperature loss"""
-        # calculate temperature loss
-        with torch.no_grad():
-            _, log_probs, _ = self.actor(observations, observation_features)
-        temperature_loss = (-self.log_alpha.exp() * (log_probs + self.target_entropy)).mean()
-        return temperature_loss
-
     def compute_loss_actor(
         self,
         observations,
+        actions,
         observation_features: Tensor | None = None,
     ) -> Tensor:
-        actions_pi, log_probs, _ = self.actor(observations, observation_features)
+        actions_pi = self.actor(observations, observation_features)
 
         q_preds = self.critic_forward(
             observations=observations,
@@ -384,8 +385,11 @@ class SACPolicy(
             observation_features=observation_features,
         )
         min_q_preds = q_preds.min(dim=0)[0]
+        alpha = 2.5
+        lmbda = alpha / min_q_preds.abs().mean().detach()
 
-        actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+        actor_loss = -lmbda * min_q_preds.mean() + F.mse_loss(actions_pi, actions)
+
         return actor_loss
 
     def _init_encoders(self):
@@ -451,18 +455,14 @@ class SACPolicy(
             encoder_is_shared=self.shared_encoder,
             **asdict(self.config.policy_kwargs),
         )
-
-        self.target_entropy = self.config.target_entropy
-        if self.target_entropy is None:
-            dim = continuous_action_dim + (1 if self.config.num_discrete_actions is not None else 0)
-            self.target_entropy = -np.prod(dim) / 2
-
-    def _init_temperature(self):
-        """Set up temperature parameter and initial log_alpha."""
-        temp_init = self.config.temperature_init
-        self.log_alpha = nn.Parameter(torch.tensor([math.log(temp_init)]))
-        self.temperature = self.log_alpha.exp().item()
-
+        self.actor_target = Policy(
+            encoder=self.encoder_actor,
+            network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
+            action_dim=continuous_action_dim,
+            encoder_is_shared=self.shared_encoder,
+            **asdict(self.config.policy_kwargs),
+        )
+        self.actor_target.load_state_dict(self.actor.state_dict())
 
 class SACObservationEncoder(nn.Module):
     """Encode image and/or state vector observations."""
@@ -804,8 +804,8 @@ class Policy(nn.Module):
         std_min: float = -5,
         std_max: float = 2,
         fixed_std: torch.Tensor | None = None,
-        init_final: float | None = None,
         use_tanh_squash: bool = False,
+        init_final: float | None = None,
         encoder_is_shared: bool = False,
     ):
         super().__init__()
@@ -831,20 +831,11 @@ class Policy(nn.Module):
         else:
             orthogonal_init()(self.mean_layer.weight)
 
-        # Standard deviation layer or parameter
-        if fixed_std is None:
-            self.std_layer = nn.Linear(out_features, action_dim)
-            if init_final is not None:
-                nn.init.uniform_(self.std_layer.weight, -init_final, init_final)
-                nn.init.uniform_(self.std_layer.bias, -init_final, init_final)
-            else:
-                orthogonal_init()(self.std_layer.weight)
-
     def forward(
         self,
         observations: torch.Tensor,
         observation_features: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ):
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
@@ -853,24 +844,7 @@ class Policy(nn.Module):
         outputs = self.network(obs_enc)
         means = self.mean_layer(outputs)
 
-        # Compute standard deviations
-        if self.fixed_std is None:
-            log_std = self.std_layer(outputs)
-            std = torch.exp(log_std)  # Match JAX "exp"
-            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
-        else:
-            std = self.fixed_std.expand_as(means)
-
-        # Build transformed distribution
-        dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
-
-        # Sample actions (reparameterized)
-        actions = dist.rsample()
-
-        # Compute log_probs
-        log_probs = dist.log_prob(actions)
-
-        return actions, log_probs, means
+        return torch.tanh(means)
 
     def get_features(self, observations: torch.Tensor) -> torch.Tensor:
         """Get encoded features from observations"""
