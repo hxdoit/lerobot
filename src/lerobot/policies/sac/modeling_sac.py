@@ -265,7 +265,7 @@ class SACPolicy(
             ).clamp(-max_action, max_action)
 
             # 2- compute q targets
-            q_targets = self.critic_forward(
+            q_targets, q_targets_mean = self.critic_forward(
                 observations=next_observations,
                 actions=next_action,
                 use_target=True,
@@ -280,10 +280,29 @@ class SACPolicy(
                 q_targets = q_targets[indices]
 
             # critics subsample size
-            min_q, _ = q_targets.min(dim=0)  # Get values from min operation
+            #min_q, _ = q_targets.min(dim=0)  # Get values from min operation
 
 
-            td_target = rewards + (1 - done) * self.config.discount * min_q
+            #td_target = rewards + (1 - done) * self.config.discount * min_q
+
+            num_atoms = 51
+            v_min = 0.0
+            v_max = 1.0
+            delta_z = (v_max - v_min) / (num_atoms - 1)
+            supports = torch.linspace(v_min, v_max, num_atoms).to(q_targets.device)
+            batch_size = q_targets.size(0)
+
+            Tz = rewards.unsqueeze(1) + self.config.discount * supports.unsqueeze(0) * (1 - done.unsqueeze(1))
+            Tz = Tz.clamp(min=v_min, max=v_max)
+            b = (Tz - v_min) / delta_z
+            l = b.floor().long()
+            u = b.ceil().long()
+            offset = torch.linspace(0, (batch_size - 1) * num_atoms, batch_size).long().unsqueeze(1).expand(batch_size,
+                                                                                                            num_atoms).to(
+                q_targets.device)
+            proj_dist = torch.zeros_like(q_targets)
+            proj_dist.view(-1).index_add_(0, (l + offset).view(-1), (q_targets * (u.float() - b)).view(-1))
+            proj_dist.view(-1).index_add_(0, (u + offset).view(-1), (q_targets * (b - l.float())).view(-1))
 
         # 3- compute predicted qs
         if self.config.num_discrete_actions is not None:
@@ -291,7 +310,7 @@ class SACPolicy(
             # In the buffer we have the full action space (continuous + discrete)
             # We need to split them before concatenating them in the critic forward
             actions: Tensor = actions[:, :DISCRETE_DIMENSION_INDEX]
-        q_preds = self.critic_forward(
+        q_preds, q_preds_mean = self.critic_forward(
             observations=observations,
             actions=actions,
             use_target=False,
@@ -300,16 +319,17 @@ class SACPolicy(
 
         # 4- Calculate loss
         # Compute state-action value loss (TD loss) for all of the Q functions in the ensemble.
-        td_target_duplicate = einops.repeat(td_target, "b -> e b", e=q_preds.shape[0])
+        #td_target_duplicate = einops.repeat(td_target, "b -> e b", e=q_preds.shape[0])
         # You compute the mean loss of the batch for each critic and then to compute the final loss you sum them up
-        critics_loss = (
-            F.mse_loss(
-                input=q_preds,
-                target=td_target_duplicate,
-                reduction="none",
-            ).mean(dim=1)
-        ).sum()
-        return critics_loss, q_preds.min(dim=0, keepdim=True)[0].mean().item()
+        #critics_loss = (
+        #    F.mse_loss(
+        #        input=q_preds,
+        #        target=td_target_duplicate,
+        #        reduction="none",
+        #    ).mean(dim=1)
+        #).sum()
+        critics_loss = -(proj_dist * torch.log(q_preds + 1e-8)).sum(dim=1).mean()
+        return critics_loss, q_preds_mean.min(dim=0, keepdim=True)[0].mean().item()
 
     def compute_loss_discrete_critic(
         self,
@@ -378,13 +398,13 @@ class SACPolicy(
     ) -> Tensor:
         actions_pi = self.actor(observations, observation_features)
 
-        q_preds = self.critic_forward(
+        _, q_preds_mean = self.critic_forward(
             observations=observations,
             actions=actions_pi,
             use_target=False,
             observation_features=observation_features,
         )
-        min_q_preds = q_preds.min(dim=0)[0]
+        min_q_preds = q_preds_mean.min(dim=0)[0]
         alpha = 2.5
         lmbda = alpha / min_q_preds.abs().mean().detach()
 
@@ -695,15 +715,22 @@ class CriticHead(nn.Module):
             dropout_rate=dropout_rate,
             final_activation=final_activation,
         )
-        self.output_layer = nn.Linear(in_features=hidden_dims[-1], out_features=1)
+        self.num_atoms = 51
+        self.v_min = 0.0
+        self.v_max = 1.0
+        self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        self.supports = torch.linspace(self.v_min, self.v_max, self.num_atoms).to('cuda:0')
+        self.output_layer = nn.Linear(in_features=hidden_dims[-1], out_features=self.num_atoms) # distributional
         if init_final is not None:
             nn.init.uniform_(self.output_layer.weight, -init_final, init_final)
             nn.init.uniform_(self.output_layer.bias, -init_final, init_final)
         else:
             orthogonal_init()(self.output_layer.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.output_layer(self.net(x))
+    def forward(self, x: torch.Tensor):
+        prob =  torch.softmax(self.output_layer(self.net(x)), dim=1)
+        expected_value = (prob * self.supports).sum(dim=-1)
+        return prob, expected_value
 
 
 class CriticEnsemble(nn.Module):
@@ -734,7 +761,7 @@ class CriticEnsemble(nn.Module):
         observations: dict[str, torch.Tensor],
         actions: torch.Tensor,
         observation_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ):
         device = get_device_from_parameters(self)
         # Move each tensor in observations to device
         observations = {k: v.to(device) for k, v in observations.items()}
@@ -745,12 +772,16 @@ class CriticEnsemble(nn.Module):
 
         # Loop through critics and collect outputs
         q_values = []
+        mean_values = []
         for critic in self.critics:
-            q_values.append(critic(inputs))
+            prob, prob_mean = critic(inputs)
+            q_values.append(prob)
+            mean_values.append(prob_mean)
 
         # Stack outputs to match expected shape [num_critics, batch_size]
-        q_values = torch.stack([q.squeeze(-1) for q in q_values], dim=0)
-        return q_values
+        q_values_mean = torch.stack([q.squeeze(-1) for q in mean_values], dim=0)
+        # avg
+        return torch.sum(torch.stack(q_values), dim=0) / len(q_values), q_values_mean
 
 
 class DiscreteCritic(nn.Module):
