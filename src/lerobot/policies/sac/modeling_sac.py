@@ -297,12 +297,14 @@ class SACPolicy(
             b = (Tz - v_min) / delta_z
             l = b.floor().long()
             u = b.ceil().long()
+            d_l = (u.float() + (u == l).float() - b).float()
+            d_u = (b - l.float()).float()
             offset = torch.linspace(0, (batch_size - 1) * num_atoms, batch_size).long().unsqueeze(1).expand(batch_size,
                                                                                                             num_atoms).to(
                 q_targets.device)
             proj_dist = torch.zeros_like(q_targets)
-            proj_dist.view(-1).index_add_(0, (l + offset).view(-1), (q_targets * (u.float() - b)).view(-1))
-            proj_dist.view(-1).index_add_(0, (u + offset).view(-1), (q_targets * (b - l.float())).view(-1))
+            proj_dist.view(-1).index_add_(0, (l + offset).view(-1), (q_targets * d_l).view(-1))
+            proj_dist.view(-1).index_add_(0, (u + offset).view(-1), (q_targets * d_u).view(-1))
 
         # 3- compute predicted qs
         if self.config.num_discrete_actions is not None:
