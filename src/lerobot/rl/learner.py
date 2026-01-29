@@ -330,6 +330,14 @@ def add_actor_information_and_train(
     batch_size = cfg.batch_size
     offline_replay_buffer = None
 
+    if cfg.dataset is not None:
+        offline_replay_buffer = initialize_offline_replay_buffer(
+            cfg = cfg,
+            device = device,
+            storage_device = storage_device,
+        )
+        batch_size: int = batch_size // 2  # We will sample from both replay buffer
+
 
     logging.info("Starting learner thread")
     interaction_message = None
@@ -388,6 +396,13 @@ def add_actor_information_and_train(
             # Sample from the iterators
             batch = next(online_iterator)
 
+            if dataset_repo_id is not None:
+                batch_offline = next(offline_iterator)
+                batch = concatenate_batch_transitions(
+                    left_batch_transitions = batch, right_batch_transition = batch_offline
+                )
+
+
             actions = batch[ACTION]
             rewards = batch["reward"]
             observations = batch["state"]
@@ -439,6 +454,12 @@ def add_actor_information_and_train(
 
         # Sample for the last update in the UTD ratio
         batch = next(online_iterator)
+
+        if dataset_repo_id is not None:
+            batch_offline = next(offline_iterator)
+            batch = concatenate_batch_transitions(
+                left_batch_transitions=batch, right_batch_transition=batch_offline
+            )
 
         actions = batch[ACTION]
         rewards = batch["reward"]
@@ -908,8 +929,18 @@ def initialize_replay_buffer(
         ReplayBuffer: Initialized replay buffer
     """
 
+    if not cfg.resume:
+        return ReplayBuffer(
+            capacity=cfg.policy.online_buffer_capacity,
+            device = device,
+            state_keys = cfg.policy.input_features.keys(),
+            storage_device = storage_device,
+            optimize_memory = True,
+        )
+
     logging.info("Resume training load the online dataset")
-    dataset_path = os.path.join("/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default", "dataset")
+    dataset_path = os.path.join(cfg.output_dir, "dataset")
+    #dataset_path = os.path.join("/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default", "dataset")
 
     # NOTE: In RL is possible to not have a dataset.
     repo_id = None

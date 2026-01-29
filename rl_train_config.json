@@ -1,7 +1,7 @@
 {
-    "output_dir": null,
+    "output_dir": "/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-24/21-36-11_default/",
     "job_name": "default",
-    "resume": false,
+    "resume": true,
     "seed": 1000,
     "num_workers": 4,
     "batch_size": 256,
@@ -16,8 +16,7 @@
     },
     "dataset": {
         "repo_id": "hxdoso/push_cube87",
-        "use_imagenet_stats": false,
-        "root": "/home/ubuntu/Downloads/embodient/lerobot/lerobot/outputs/train/2026-01-19/11-07-22_default/dataset"
+        "use_imagenet_stats": false
     },
     "policy": {
         "type": "sac",

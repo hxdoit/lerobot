@@ -388,7 +388,9 @@ class SACPolicy(
         alpha = 2.5
         lmbda = alpha / min_q_preds.abs().mean().detach()
 
-        actor_loss = -lmbda * min_q_preds.mean() + F.mse_loss(actions_pi, actions)
+        #actor_loss = -lmbda * min_q_preds.mean() + F.mse_loss(actions_pi, actions)
+        # remove bc in online training
+        actor_loss = -min_q_preds.mean()
 
         return actor_loss
 
