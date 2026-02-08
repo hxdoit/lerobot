@@ -754,7 +754,6 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
         params=[
             p
             for n, p in policy.actor.named_parameters()
-            if not policy.config.shared_encoder or not n.startswith("encoder")
         ],
         lr=cfg.policy.actor_lr,
     )

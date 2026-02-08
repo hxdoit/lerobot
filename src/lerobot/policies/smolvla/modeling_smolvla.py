@@ -244,6 +244,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
+        self.dataset_stats = {}
+
+    def set_dataset_stats(self, dataset_stats):
+        self.dataset_stats = dataset_stats
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -352,36 +356,45 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
-    def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> dict[str, Tensor]:
+    def normalize_state(self, state):
+        mean = self.dataset_stats.get('observation.state')['mean']
+        std = self.dataset_stats.get('observation.state')['std']
+        if mean is None or std is None:
+            raise ValueError(
+                "MEAN_STD normalization mode requires mean and std stats, please update the dataset with the correct stats"
+            )
+        # Avoid division by zero by adding a small epsilon.
+        mean = torch.tensor(mean).to(state.device)
+        std = torch.tensor(std).to(state.device)
+        denom = std + 1e-8
+        return (state - mean) / denom
+
+    def forward(self, batch: dict[str, Tensor], noise=None, time=None):
         """Do a full training forward pass to compute the loss"""
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
+
+        batch['observation.state'] = self.normalize_state(batch['observation.state'])
         state = self.prepare_state(batch)
-        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
-        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        # lang = "reverse the direction of the building block and place it back into the green area\n"
+        lang_token = torch.tensor([26700,   260,  4376,   282,   260,  2194,  3608,   284,  1379,   357,
+         1056,   618,   260,  2654,  1557,   198,     2,     2,     2,     2,
+            2,     2,     2,     2,     2,     2,     2,     2,     2,     2,
+            2,     2,     2,     2,     2,     2,     2,     2,     2,     2,
+            2,     2,     2,     2,     2,     2,     2,     2])
+        lang_mask = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).to(dtype=torch.bool)
+        lang_tokens = lang_token.unsqueeze(0).expand(batch['observation.state'].shape[0], -1).to(batch['observation.state'].device)
+        lang_masks = lang_mask.unsqueeze(0).expand(batch['observation.state'].shape[0], -1).to(batch['observation.state'].device)
+
         actions = self.prepare_action(batch)
-        actions_is_pad = batch.get("actions_id_pad")
-        loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
-        loss_dict["losses_after_forward"] = losses.clone()
+        actions = actions.unsqueeze(1)
 
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone()
-
-        # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
-        loss_dict["losses_after_rm_padding"] = losses.clone()
-
-        # For backward pass
-        loss = losses.mean()
-        # For backward pass
-        loss_dict["loss"] = loss.item()
-        return loss, loss_dict
+        return self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -399,8 +412,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
-            if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+            #if self.config.resize_imgs_with_padding is not None:
+            #    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
             # Normalize from range [0,1] to [-1,1] as expacted by siglip
             img = img * 2.0 - 1.0
@@ -670,43 +683,27 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, actions, timestamp=None):
         embs = []
         pad_masks = []
         att_masks = []
 
         # Fuse timestep + action information using an MLP
-        action_emb = self.action_in_proj(noisy_actions)
+        action_emb = self.action_in_proj(actions)
         device = action_emb.device
         bsize = action_emb.shape[0]
         dtype = action_emb.dtype
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.vlm_with_expert.expert_hidden_size,
-            self.config.min_period,
-            self.config.max_period,
-            device=device,
-        )
-        time_emb = time_emb.type(dtype=dtype)
-
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
-
-        action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)  # swish == silu
-        action_time_emb = self.action_time_mlp_out(action_time_emb)
 
         # Add to input tokens
-        embs.append(action_time_emb)
+        embs.append(action_emb)
 
-        bsize, action_time_dim = action_time_emb.shape[:2]
+        bsize, action_time_dim = action_emb.shape[0], 1
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] * self.config.chunk_size
+        att_masks += [1] * 1
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
@@ -716,20 +713,11 @@ class VLAFlowMatching(nn.Module):
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(actions)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -744,12 +732,10 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -1 :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        return suffix_out
 
     def sample_actions(
         self,

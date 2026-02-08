@@ -18,6 +18,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import asdict
+from pathlib import Path
 from typing import Literal
 
 import einops
@@ -28,6 +29,8 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
 
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.factory import make_policy
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig, is_image_feature
 from lerobot.policies.utils import get_device_from_parameters
@@ -50,6 +53,13 @@ class SACPolicy(
         config.validate_features()
         self.config = config
 
+        self.smolvla_config = PreTrainedConfig.from_pretrained('lerobot/smolvla_base')
+        self.smolvla_config.pretrained_path = Path('lerobot/smolvla_base')
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+        kwargs = {"pretrained_name_or_path": self.smolvla_config.pretrained_path, "config": self.smolvla_config}
+        self.smolvla_encoder = SmolVLAPolicy.from_pretrained(**kwargs)
+        self.smolvla_encoder.set_dataset_stats(self.config.dataset_stats)
+
         # Determine action dimension and initialize all components
         continuous_action_dim = config.output_features[ACTION].shape[0]
         self._init_encoders()
@@ -61,7 +71,6 @@ class SACPolicy(
             "actor": [
                 p
                 for n, p in self.actor.named_parameters()
-                if not n.startswith("encoder") or not self.shared_encoder
             ],
             "critic": self.critic_ensemble.parameters(),
         }
@@ -395,16 +404,14 @@ class SACPolicy(
     def _init_encoders(self):
         """Initialize shared or separate encoders for actor and critic."""
         self.shared_encoder = self.config.shared_encoder
-        self.encoder_critic = SACObservationEncoder(self.config)
-        self.encoder_actor = (
-            self.encoder_critic if self.shared_encoder else SACObservationEncoder(self.config)
-        )
+        self.encoder_critic = self.smolvla_encoder
+        self.encoder_actor = SACObservationEncoder(self.config)
 
     def _init_critics(self, continuous_action_dim):
         """Build critic ensemble, targets, and optional discrete critic."""
         heads = [
             CriticHead(
-                input_dim=self.encoder_critic.output_dim + continuous_action_dim,
+                input_dim=720,
                 **asdict(self.config.critic_network_kwargs),
             )
             for _ in range(self.config.num_critics)
@@ -412,7 +419,7 @@ class SACPolicy(
         self.critic_ensemble = CriticEnsemble(encoder=self.encoder_critic, ensemble=heads)
         target_heads = [
             CriticHead(
-                input_dim=self.encoder_critic.output_dim + continuous_action_dim,
+                input_dim=720,
                 **asdict(self.config.critic_network_kwargs),
             )
             for _ in range(self.config.num_critics)
@@ -711,7 +718,7 @@ class CriticEnsemble(nn.Module):
     CriticEnsemble wraps multiple CriticHead modules into an ensemble.
 
     Args:
-        encoder (SACObservationEncoder): encoder for observations.
+        encoder (smolvla encoder): encoder for observations.
         ensemble (List[CriticHead]): list of critic heads.
         init_final (float | None): optional initializer scale for final layers.
 
@@ -720,7 +727,7 @@ class CriticEnsemble(nn.Module):
 
     def __init__(
         self,
-        encoder: SACObservationEncoder,
+        encoder,
         ensemble: list[CriticHead],
         init_final: float | None = None,
     ):
@@ -737,19 +744,22 @@ class CriticEnsemble(nn.Module):
     ) -> torch.Tensor:
         device = get_device_from_parameters(self)
         # Move each tensor in observations to device
-        observations = {k: v.to(device) for k, v in observations.items()}
+        batch = {k: v.to(device) for k, v in observations.items()}
+        batch['action'] = actions.to(device)
+        batch['observation.images.camera1'] = batch['observation.images.top']
+        del batch['observation.images.top']
 
-        obs_enc = self.encoder(observations, cache=observation_features)
+        obs_enc = self.encoder(batch)
 
-        inputs = torch.cat([obs_enc, actions], dim=-1)
+        #inputs = torch.cat([obs_enc, actions], dim=-1)
 
         # Loop through critics and collect outputs
         q_values = []
         for critic in self.critics:
-            q_values.append(critic(inputs))
+            q_values.append(critic(obs_enc))
 
         # Stack outputs to match expected shape [num_critics, batch_size]
-        q_values = torch.stack([q.squeeze(-1) for q in q_values], dim=0)
+        q_values = torch.stack([q.squeeze() for q in q_values], dim=0)
         return q_values
 
 
