@@ -1048,6 +1048,7 @@ def check_nan_in_transition(
 
 
 def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
+    return
     logging.debug("[LEARNER] Pushing actor policy to the queue")
 
     # Create a dictionary to hold all the state dicts
