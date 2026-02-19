@@ -392,7 +392,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = lang_mask.unsqueeze(0).expand(batch['observation.state'].shape[0], -1).to(batch['observation.state'].device)
 
         actions = self.prepare_action(batch)
-        actions = actions.unsqueeze(1)
+        #actions = actions.unsqueeze(1)
 
         return self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
 
@@ -697,13 +697,13 @@ class VLAFlowMatching(nn.Module):
 
         # Add to input tokens
         embs.append(action_emb)
-
-        bsize, action_time_dim = action_emb.shape[0], 1
+        action_chunk_size = action_emb.shape[1]
+        bsize, action_time_dim = action_emb.shape[0], action_chunk_size
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] * 1
+        att_masks += [1] * action_chunk_size
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
@@ -732,7 +732,8 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
-        suffix_out = suffix_out[:, -1 :]
+        #suffix_out = suffix_out[:, -1 :]
+        suffix_out = suffix_out.mean(dim=1) # avg between actions in a chunk
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         return suffix_out

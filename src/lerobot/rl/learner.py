@@ -399,9 +399,18 @@ def add_actor_information_and_train(
                 policy=policy, observations=observations, next_observations=next_observations
             )
 
+            # Handle action chunk: if actions have shape (B, chunk_size, action_dim)
+            # Otherwise, assume shape is (B, action_dim)
+            if actions.ndim == 3:
+                # Action chunk shape: (B, chunk_size, action_dim)
+                actions_for_forward = actions[:, :, :3]  # only keep x&y&z
+            else:
+                # Single action shape: (B, action_dim)
+                actions_for_forward = actions[:, :3]  # only keep x&y&z
+
             # Create a batch dictionary with all required elements for the forward method
             forward_batch = {
-                ACTION: actions[:, :3], # only keep x&y&z
+                ACTION: actions_for_forward,
                 "reward": rewards,
                 "state": observations,
                 "next_state": next_observations,
@@ -452,9 +461,18 @@ def add_actor_information_and_train(
             policy=policy, observations=observations, next_observations=next_observations
         )
 
+        # Handle action chunk: if actions have shape (B, chunk_size, action_dim)
+        # Otherwise, assume shape is (B, action_dim)
+        if actions.ndim == 3:
+            # Action chunk shape: (B, chunk_size, action_dim)
+            actions_for_forward = actions[:, :, :3]  # only keep x&y&z
+        else:
+            # Single action shape: (B, action_dim)
+            actions_for_forward = actions[:, :3]  # only keep x&y&z
+
         # Create a batch dictionary with all required elements for the forward method
         forward_batch = {
-            ACTION: actions[:, :3], # only keep x&y&z
+            ACTION: actions_for_forward,
             "reward": rewards,
             "state": observations,
             "next_state": next_observations,

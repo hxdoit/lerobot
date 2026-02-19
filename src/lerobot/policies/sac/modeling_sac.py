@@ -827,6 +827,7 @@ class Policy(nn.Module):
         self.fixed_std = fixed_std
         self.use_tanh_squash = use_tanh_squash
         self.encoder_is_shared = encoder_is_shared
+        self.action_chunk_size = 5
 
         # Find the last Linear layer's output dimension
         for layer in reversed(network.net):
@@ -834,7 +835,7 @@ class Policy(nn.Module):
                 out_features = layer.out_features
                 break
         # Mean layer
-        self.mean_layer = nn.Linear(out_features, action_dim)
+        self.mean_layer = nn.Linear(out_features, action_dim * self.action_chunk_size)
         if init_final is not None:
             nn.init.uniform_(self.mean_layer.weight, -init_final, init_final)
             nn.init.uniform_(self.mean_layer.bias, -init_final, init_final)
@@ -854,7 +855,7 @@ class Policy(nn.Module):
         outputs = self.network(obs_enc)
         means = self.mean_layer(outputs)
 
-        return torch.tanh(means)
+        return torch.tanh(means).reshape(-1, self.action_chunk_size, self.action_dim)
 
     def get_features(self, observations: torch.Tensor) -> torch.Tensor:
         """Get encoded features from observations"""

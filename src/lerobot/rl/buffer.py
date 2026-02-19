@@ -659,6 +659,9 @@ class ReplayBuffer:
         if not has_done_key:
             print("'next.done' key not found in dataset. Inferring from episode boundaries...")
 
+        # Action chunk size
+        action_chunk_size = 5
+
         for i in tqdm(range(num_frames)):
             current_sample = dataset[i]
 
@@ -668,8 +671,33 @@ class ReplayBuffer:
                 val = current_sample[key]
                 current_state[key] = val.unsqueeze(0)  # Add batch dimension
 
-            # ----- 2) Action -----
-            action = current_sample[ACTION].unsqueeze(0)  # Add batch dimension
+            # ----- 2) Action chunk (collect 10 consecutive actions) -----
+            action_chunk = []
+            current_episode_index = current_sample["episode_index"]
+            
+            for j in range(action_chunk_size):
+                idx = i + j
+                if idx < num_frames:
+                    future_sample = dataset[idx]
+                    # Check if we're still in the same episode
+                    if future_sample["episode_index"] == current_episode_index:
+                        action_chunk.append(future_sample[ACTION])
+                    else:
+                        # If we've crossed episode boundary, use the last valid action
+                        if len(action_chunk) > 0:
+                            action_chunk.append(action_chunk[-1])
+                        else:
+                            # If no valid action yet, use current action
+                            action_chunk.append(current_sample[ACTION])
+                else:
+                    # If we've reached the end of dataset, repeat the last action
+                    if len(action_chunk) > 0:
+                        action_chunk.append(action_chunk[-1])
+                    else:
+                        action_chunk.append(current_sample[ACTION])
+            
+            # Stack actions into shape (chunk_size, action_dim), then add batch dimension -> (1, chunk_size, action_dim)
+            action = torch.stack(action_chunk, dim=0).unsqueeze(0)  # Shape: (1, chunk_size, action_dim)
 
             # ----- 3) Reward and done -----
             reward = float(current_sample[REWARD].item())  # ensure float

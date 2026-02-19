@@ -195,7 +195,7 @@ class SACConfig(PreTrainedConfig):
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
 
     # Optimizations
-    use_torch_compile: bool = True
+    use_torch_compile: bool = False
 
     def __post_init__(self):
         super().__post_init__()
