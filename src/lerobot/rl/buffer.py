@@ -661,78 +661,104 @@ class ReplayBuffer:
 
         # Action chunk size
         action_chunk_size = 5
+        discount = 0.99
 
         for i in tqdm(range(num_frames)):
             current_sample = dataset[i]
+            current_episode_index = current_sample["episode_index"]
 
-            # ----- 1) Current state -----
+            # Ensure we can build a full, valid chunk inside the same episode
+            last_idx = i + action_chunk_size - 1
+            if last_idx >= num_frames:
+                continue
+            # Condition 1: the chunk must not cross episode boundaries
+            same_episode = True
+            for idx in range(i, last_idx + 1):
+                if dataset[idx]["episode_index"] != current_episode_index:
+                    same_episode = False
+                    break
+            if not same_episode:
+                continue
+
+            # ----- 1) Current state (state at the first step of the chunk) -----
             current_state: dict[str, torch.Tensor] = {}
             for key in state_keys:
                 val = current_sample[key]
                 current_state[key] = val.unsqueeze(0)  # Add batch dimension
 
-            # ----- 2) Action chunk (collect 10 consecutive actions) -----
-            action_chunk = []
-            current_episode_index = current_sample["episode_index"]
-            
-            for j in range(action_chunk_size):
-                idx = i + j
-                if idx < num_frames:
-                    future_sample = dataset[idx]
-                    # Check if we're still in the same episode
-                    if future_sample["episode_index"] == current_episode_index:
-                        action_chunk.append(future_sample[ACTION])
-                    else:
-                        # If we've crossed episode boundary, use the last valid action
-                        if len(action_chunk) > 0:
-                            action_chunk.append(action_chunk[-1])
-                        else:
-                            # If no valid action yet, use current action
-                            action_chunk.append(current_sample[ACTION])
-                else:
-                    # If we've reached the end of dataset, repeat the last action
-                    if len(action_chunk) > 0:
-                        action_chunk.append(action_chunk[-1])
-                    else:
-                        action_chunk.append(current_sample[ACTION])
-            
+            # ----- 2) Action chunk (collect consecutive actions, no padding) -----
+            action_chunk = [dataset[idx][ACTION] for idx in range(i, last_idx + 1)]
             # Stack actions into shape (chunk_size, action_dim), then add batch dimension -> (1, chunk_size, action_dim)
             action = torch.stack(action_chunk, dim=0).unsqueeze(0)  # Shape: (1, chunk_size, action_dim)
 
-            # ----- 3) Reward and done -----
-            reward = float(current_sample[REWARD].item())  # ensure float
+            # ----- 3) Reward and done at chunk level -----
+            # Collect per-step rewards and done flags for the whole chunk
+            step_rewards: list[float] = []
+            step_dones: list[bool] = []
+            for offset in range(action_chunk_size):
+                idx = i + offset
+                sample_step = dataset[idx]
+                step_rewards.append(float(sample_step[REWARD].item()))
 
-            # Determine done flag - use next.done if available, otherwise infer from episode boundaries
-            if has_done_key:
-                done = bool(current_sample[DONE].item())  # ensure bool
-            else:
-                # If this is the last frame or if next frame is in a different episode, mark as done
-                done = False
-                if i == num_frames - 1:
-                    done = True
-                elif i < num_frames - 1:
-                    next_sample = dataset[i + 1]
-                    if next_sample["episode_index"] != current_sample["episode_index"]:
-                        done = True
+                if has_done_key:
+                    step_done = bool(sample_step[DONE].item())
+                else:
+                    # Infer done for this step from episode boundary
+                    step_done = False
+                    if idx == num_frames - 1:
+                        step_done = True
+                    elif idx < num_frames - 1:
+                        next_sample_step = dataset[idx + 1]
+                        if next_sample_step["episode_index"] != sample_step["episode_index"]:
+                            step_done = True
+                step_dones.append(step_done)
+
+            # Condition 3: chunk done is True if any step in the chunk is done
+            done = any(step_dones)
+
+            # Condition 4: discounted reward over the chunk
+            reward = 0.0
+            for t, r in enumerate(step_rewards):
+                reward += (discount**t) * r
 
             # TODO: (azouitine) Handle truncation (using the same value as done for now)
             truncated = done
 
             # ----- 4) Next state -----
-            # If not done and the next sample is in the same episode, we pull the next sample's state.
-            # Otherwise (done=True or next sample crosses to a new episode), next_state = current_state.
-            next_state = current_state  # default
-            if not done and (i < num_frames - 1):
-                next_sample = dataset[i + 1]
-                if next_sample["episode_index"] == current_sample["episode_index"]:
-                    # Build next_state from the same keys
+            # Condition 5: chunk next_state is the next_state of the last step in the chunk
+            last_sample = dataset[last_idx]
+            last_episode_index = last_sample["episode_index"]
+
+            # Determine done flag for the last step to know if it has a valid next state
+            if has_done_key:
+                last_done = bool(last_sample[DONE].item())
+            else:
+                last_done = False
+                if last_idx == num_frames - 1:
+                    last_done = True
+                elif last_idx < num_frames - 1:
+                    next_last_sample = dataset[last_idx + 1]
+                    if next_last_sample["episode_index"] != last_episode_index:
+                        last_done = True
+
+            # Default: next_state is the state of the last step itself
+            next_state: dict[str, torch.Tensor] = {}
+            for key in state_keys:
+                val = last_sample[key]
+                next_state[key] = val.unsqueeze(0)
+
+            # If the last step is not done and we stay in the same episode, use the following frame as next_state
+            if (not last_done) and (last_idx < num_frames - 1):
+                candidate_next = dataset[last_idx + 1]
+                if candidate_next["episode_index"] == last_episode_index:
                     next_state_data: dict[str, torch.Tensor] = {}
                     for key in state_keys:
-                        val = next_sample[key]
-                        next_state_data[key] = val.unsqueeze(0)  # Add batch dimension
+                        val = candidate_next[key]
+                        next_state_data[key] = val.unsqueeze(0)
                     next_state = next_state_data
 
             # ----- 5) Complementary info (if available) -----
+            # Use complementary info from the first step of the chunk
             complementary_info = None
             if has_complementary_info:
                 complementary_info = {}

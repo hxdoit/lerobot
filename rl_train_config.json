@@ -134,7 +134,7 @@
         "offline_buffer_capacity": 10000,
         "online_step_before_learning": 10,
         "policy_update_freq": 1,
-        "discount": 0.995,
+        "discount": 0.99,
         "async_prefetch": false,
         "temperature_init": 0.01,
         "num_critics": 2,
